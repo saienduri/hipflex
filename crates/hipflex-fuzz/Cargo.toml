@@ -1,0 +1,18 @@
+[package]
+name = "hipflex-fuzz"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+dashmap = { workspace = true }
+hipflex-internal = { workspace = true }
+
+[dev-dependencies]
+proptest = "1.6"
+hipflex-internal = { workspace = true }
+tempfile = { workspace = true }
