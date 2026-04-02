@@ -1,0 +1,35 @@
+[workspace.package]
+license = "Apache-2.0"
+
+[workspace]
+resolver = "2"
+members = [
+  "crates/hipflex",
+  "crates/hipflex-internal",
+  "crates/hipflex-macro",
+  "crates/hipflex-fuzz",
+]
+
+[workspace.dependencies]
+hipflex-internal = { path = "crates/hipflex-internal" }
+hipflex-macro = { path = "crates/hipflex-macro" }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2.4"
+thiserror = "2.0"
+ctor = "0.6"
+anyhow = "1.0"
+serde = "1.0"
+serde_json = "1.0"
+once_cell = "1.19"
+frida-gum = { git = "https://github.com/NexusGPU/frida-rust.git", rev = "5f48fa8" }
+libc = "0.2"
+tempfile = "3.24"
+proc-macro2 = "1"
+quote = "1"
+syn = "2"
+libloading = "0.8"
+shared_memory = { git = "https://github.com/NexusGPU/shared_memory.git", rev = "d679661" }
+glob = "0.3"
+dashmap = "6.1"
+humantime = "2.2"
