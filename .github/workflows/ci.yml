@@ -1,0 +1,100 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_call:
+
+jobs:
+  fuzzer:
+    name: Rust fuzzer + unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p hipflex -p hipflex-fuzz -p hipflex-internal
+
+  resolve-nightly:
+    name: Resolve latest nightly
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - name: Find latest available nightly
+        id: resolve
+        run: |
+          # Try today first, then go back up to 3 days to find an available nightly
+          for days_ago in 0 1 2 3; do
+            DATE=$(date -u -d "-${days_ago} days" +%Y%m%d)
+            VERSION="7.13.0a${DATE}"
+            URL="https://rocm.nightlies.amd.com/tarball/therock-dist-linux-gfx94X-dcgpu-${VERSION}.tar.gz"
+            if curl -fsSI "$URL" >/dev/null 2>&1; then
+              echo "Found nightly: ${VERSION}"
+              echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          echo "No recent nightly found, skipping"
+          echo "version=" >> "$GITHUB_OUTPUT"
+
+  gpu-tests:
+    name: GPU tests (ROCm ${{ matrix.rocm_version }})
+    needs: resolve-nightly
+    runs-on: mi325x-gpu
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rocm_version: "7.11.0rc0"
+            release_type: prereleases
+          - rocm_version: "7.12.0rc0"
+            release_type: prereleases
+          - rocm_version: nightly
+            release_type: nightlies
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set ROCm version
+        id: rocm
+        run: |
+          if [ "${{ matrix.rocm_version }}" = "nightly" ]; then
+            VERSION="${{ needs.resolve-nightly.outputs.version }}"
+            if [ -z "$VERSION" ]; then
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              echo "No nightly available, skipping"
+            else
+              echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+              echo "skip=false" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            echo "version=${{ matrix.rocm_version }}" >> "$GITHUB_OUTPUT"
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build test image (ROCm ${{ steps.rocm.outputs.version }})
+        if: steps.rocm.outputs.skip != 'true'
+        run: |
+          docker build -t hipflex-tests-${{ steps.rocm.outputs.version }} \
+            -f tests/gpu-tests/Dockerfile \
+            --build-arg ROCM_VERSION=${{ steps.rocm.outputs.version }} \
+            --build-arg ROCM_RELEASE_TYPE=${{ matrix.release_type }} \
+            .
+      - name: Resolve GPU devices
+        if: steps.rocm.outputs.skip != 'true'
+        id: gpu
+        run: |
+          render_gid=$(stat -c '%g' /dev/kfd)
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          echo "flags=--device=/dev/kfd ${DEVICE_FLAG} --group-add video --group-add ${render_gid:-render}" >> "$GITHUB_OUTPUT"
+      - name: Run GPU tests
+        if: steps.rocm.outputs.skip != 'true'
+        run: |
+          docker run --rm \
+            ${{ steps.gpu.outputs.flags }} \
+            hipflex-tests-${{ steps.rocm.outputs.version }} \
+            pytest -v tests/gpu-tests/
