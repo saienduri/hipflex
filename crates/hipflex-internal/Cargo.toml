@@ -1,0 +1,23 @@
+[package]
+name = "hipflex-internal"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+frida-gum = { workspace = true, features = ["auto-download", "std", "invocation-listener"] }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+shared_memory = { workspace = true }
+libc = { workspace = true }
+glob = { workspace = true }
+dashmap = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+procfs = "0.18"
+
+[dev-dependencies]
+tempfile = { workspace = true }
