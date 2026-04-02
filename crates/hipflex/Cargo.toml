@@ -1,0 +1,25 @@
+[package]
+name = "hipflex"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+path = "src/hipflex.rs"
+
+[dependencies]
+hipflex-internal = { workspace = true }
+hipflex-macro = { workspace = true }
+tracing = { workspace = true }
+ctor = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+libloading = { workspace = true }
+once_cell = { workspace = true }
+dashmap = { workspace = true }
+humantime = { workspace = true }
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
