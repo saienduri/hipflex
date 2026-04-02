@@ -1,0 +1,1170 @@
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use dashmap::DashMap;
+use hipflex_internal::shared_memory::proc_slots::ProcSlotHandle;
+use hipflex_internal::shared_memory::{handle::SharedMemoryHandle, SharedDeviceState};
+use once_cell::sync::OnceCell;
+
+use crate::hiplib::{self, HipDevice, HipError};
+
+/// Isolation mode that activates memory enforcement hooks.
+pub(crate) const ISOLATION_SOFT: &str = "soft";
+
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum Error {
+    #[error("HIP error: {0}")]
+    Hip(HipError),
+
+    #[error("Shared memory access failed: {0}")]
+    SharedMemory(#[from] anyhow::Error),
+
+    #[error("Device not configured: {0}")]
+    DeviceNotConfigured(String),
+
+    #[error("Allocation exceeds limit on device {device_idx}: used ({used}) + request ({request}) > limit ({limit})")]
+    OverLimit {
+        used: u64,
+        request: u64,
+        limit: u64,
+        device_idx: usize,
+    },
+
+    #[error("Limiter not initialized")]
+    LimiterNotInitialized,
+}
+
+pub(crate) struct Limiter {
+    shared_memory_handle: OnceCell<Arc<SharedMemoryHandle>>,
+    /// Cache: HIP device ordinal -> (raw_device_index, device_uuid)
+    hip_device_mapping: DashMap<HipDevice, (usize, String)>,
+    /// Configured devices: (raw_device_index, device_uuid) sorted/deduped from config
+    gpu_idx_uuids: Vec<(usize, String)>,
+    isolation: Option<String>,
+    /// Tracks pointer address -> (device_index, allocation_size) for free hooks.
+    /// Process-local: pointer addresses are virtual and only meaningful within this process.
+    /// The actual pod_memory_used counter lives in SHM (shared across processes).
+    allocation_tracker: DashMap<usize, (usize, u64)>,
+    /// When true, heartbeat warnings are suppressed (standalone mode).
+    standalone: bool,
+    /// Monotonic allocation counter for periodic reconciliation diagnostics.
+    alloc_count: AtomicU64,
+    /// Per-PID usage tracking in SHM (standalone mode only).
+    proc_slots: Option<ProcSlotHandle>,
+    /// Process command line for diagnostics (from /proc/self/cmdline at init).
+    process_cmdline: String,
+}
+
+impl std::fmt::Debug for Limiter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("Limiter").finish()
+    }
+}
+
+/// Normalize an AMD GPU UUID to a PCI BDF string for matching.
+/// AMD GPU UUIDs are PCI BDF-based: "AMD-GPU-0000:03:00.0"
+/// UUIDs are lowercased during config generation, so we normalize to lowercase
+/// and strip the "amd-gpu-" prefix.
+pub(crate) fn normalize_uuid_to_bdf(uuid: &str) -> String {
+    let lowered = uuid.to_lowercase();
+    lowered
+        .strip_prefix("amd-gpu-")
+        .unwrap_or(&lowered)
+        .to_string()
+}
+
+/// Match config GPU UUIDs against enumerated HIP devices by PCI bus ID.
+/// Returns sorted (device_index, uuid) pairs for matched devices.
+///
+/// `gpu_uuids`: UUIDs from the pod config (may have "AMD-GPU-" prefix, mixed case)
+/// `enumerated_devices`: (device_index, pci_bus_id) pairs from HIP device enumeration
+pub(crate) fn resolve_device_indices(
+    gpu_uuids: &[String],
+    enumerated_devices: &[(i32, String)],
+) -> Vec<(usize, String)> {
+    let mut resolved = Vec::new();
+    for uuid in gpu_uuids {
+        let target_bdf = normalize_uuid_to_bdf(uuid);
+        if let Some((device_index, _)) = enumerated_devices
+            .iter()
+            .find(|(_, pci_bus_id)| pci_bus_id.to_lowercase() == target_bdf)
+        {
+            resolved.push((*device_index as usize, uuid.clone()));
+        } else {
+            tracing::warn!(
+                uuid = uuid.as_str(),
+                "No HIP device found matching UUID, skipping"
+            );
+        }
+    }
+    resolved.sort_by_key(|(idx, _)| *idx);
+    resolved.dedup_by_key(|(idx, _)| *idx);
+    resolved
+}
+
+/// (HIP device ordinal, PCI Bus/Device/Function address)
+pub(crate) type EnumeratedDevice = (i32, String);
+
+/// Read `/proc/self/cmdline` and return a human-readable command string.
+/// Returns a truncated string (max 200 chars) to avoid bloating log lines.
+fn read_process_cmdline() -> String {
+    let raw = match std::fs::read("/proc/self/cmdline") {
+        Ok(bytes) => bytes,
+        Err(_) => return String::from("<unknown>"),
+    };
+    let cmdline: String = raw
+        .split(|&b| b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if cmdline.is_empty() {
+        return String::from("<unknown>");
+    }
+    if cmdline.len() > 200 {
+        format!("{}…", &cmdline[..200])
+    } else {
+        cmdline
+    }
+}
+
+/// Read DRM fdinfo from `/proc/self/fdinfo/*` in a single pass and return
+/// `drm-resident-vram` in bytes, keyed by PCI BDF (from `drm-pdev:` line).
+///
+/// Each open fd to a DRM render node includes a `drm-pdev:` line identifying which GPU
+/// it belongs to. We bucket VRAM by BDF so callers can look up per-device usage without
+/// re-scanning fdinfo for each GPU.
+///
+/// Fds without a `drm-pdev:` line are skipped (non-DRM fds).
+fn read_drm_resident_vram_all() -> std::collections::HashMap<String, u64> {
+    let mut by_bdf: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
+    let entries = match std::fs::read_dir("/proc/self/fdinfo") {
+        Ok(entries) => entries,
+        Err(_) => return by_bdf,
+    };
+    for entry in entries.flatten() {
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        // Extract BDF from drm-pdev line
+        let mut bdf = None;
+        let mut vram_bytes: u64 = 0;
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("drm-pdev:") {
+                bdf = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("drm-resident-vram:") {
+                let rest = rest.trim();
+                if let Some(kib_str) = rest.strip_suffix(" KiB") {
+                    if let Ok(kib) = kib_str.trim().parse::<u64>() {
+                        vram_bytes += kib * 1024;
+                    }
+                }
+            }
+        }
+        if let Some(bdf) = bdf {
+            *by_bdf.entry(bdf).or_insert(0) += vram_bytes;
+        }
+    }
+    by_bdf
+}
+
+impl Limiter {
+    /// `pre_enumerated`: devices from sysfs; when `Some`, skips HIP runtime calls (fork-safe).
+    pub(crate) fn new(
+        mut gpu_uuids: Vec<String>,
+        isolation: Option<String>,
+        standalone: bool,
+        proc_slots: Option<ProcSlotHandle>,
+        pre_enumerated: Option<Vec<EnumeratedDevice>>,
+    ) -> Result<Self, Error> {
+        gpu_uuids.sort();
+        gpu_uuids.dedup();
+
+        let enumerated_devices = match pre_enumerated {
+            Some(devices) => devices,
+            None => {
+                let hip = hiplib::hiplib();
+                let device_count = hip.get_device_count().map_err(Error::Hip)?;
+                let mut devices = Vec::new();
+                for device_index in 0..device_count {
+                    let pci_bus_id = hip.get_pci_bus_id(device_index).map_err(Error::Hip)?;
+                    devices.push((device_index, pci_bus_id));
+                }
+                devices
+            }
+        };
+
+        let gpu_idx_uuids = resolve_device_indices(&gpu_uuids, &enumerated_devices);
+
+        let process_cmdline = read_process_cmdline();
+
+        tracing::info!(
+            cmdline = process_cmdline,
+            "Limiter initialized with GPU UUIDs and indices: {:?}",
+            gpu_idx_uuids
+        );
+
+        Ok(Self {
+            shared_memory_handle: OnceCell::new(),
+            hip_device_mapping: DashMap::new(),
+            gpu_idx_uuids,
+            isolation,
+            allocation_tracker: DashMap::new(),
+            standalone,
+            alloc_count: AtomicU64::new(0),
+            proc_slots,
+            process_cmdline,
+        })
+    }
+
+    /// Eagerly set the SHM handle (used by standalone mode which creates its own SHM).
+    pub(crate) fn set_shared_memory_handle(&self, handle: SharedMemoryHandle) -> Result<(), Error> {
+        self.shared_memory_handle
+            .set(Arc::new(handle))
+            .map_err(|_| Error::SharedMemory(anyhow::anyhow!("SHM handle already set")))
+    }
+
+    fn get_or_init_shared_memory(&self) -> Result<&SharedMemoryHandle, Error> {
+        Ok(self.get_or_init_shared_memory_arc()?.as_ref())
+    }
+
+    fn get_or_init_shared_memory_arc(&self) -> Result<&Arc<SharedMemoryHandle>, Error> {
+        self.shared_memory_handle.get_or_try_init(|| {
+            if let Some(shm_path) = crate::mock_shm_path() {
+                Ok(Arc::new(SharedMemoryHandle::mock(
+                    shm_path,
+                    self.gpu_idx_uuids.clone(),
+                )))
+            } else {
+                SharedMemoryHandle::open(shm_path())
+                    .map(Arc::new)
+                    .map_err(Error::SharedMemory)
+            }
+        })
+    }
+
+    pub(crate) fn device_index_by_hip_device(&self, hip_device: HipDevice) -> Result<usize, Error> {
+        if let Some(entry) = self.hip_device_mapping.get(&hip_device) {
+            return Ok(entry.0);
+        }
+
+        // Look up via PCI bus ID
+        let hip = hiplib::hiplib();
+        let pci_bus_id = hip.get_pci_bus_id(hip_device).map_err(Error::Hip)?;
+        let pci_bus_id_lower = pci_bus_id.to_lowercase();
+
+        for (idx, uuid) in &self.gpu_idx_uuids {
+            let target_bdf = normalize_uuid_to_bdf(uuid);
+            if pci_bus_id_lower == target_bdf {
+                self.hip_device_mapping
+                    .insert(hip_device, (*idx, uuid.clone()));
+                return Ok(*idx);
+            }
+        }
+
+        Err(Error::DeviceNotConfigured(format!(
+            "HIP device {hip_device}"
+        )))
+    }
+
+    /// Log a warning if the heartbeat is stale (non-standalone mode only).
+    fn warn_if_stale_heartbeat(&self, state: &SharedDeviceState, device_idx: usize) {
+        if !self.standalone && !state.is_healthy(Duration::from_secs(2)) {
+            tracing::warn!(
+                device_idx,
+                last_heartbeat = state.get_last_heartbeat(),
+                "Stale heartbeat detected, continuing with enforcement"
+            );
+        }
+    }
+
+    pub(crate) fn get_pod_memory_usage(
+        &self,
+        raw_device_index: usize,
+    ) -> Result<(u64, u64), Error> {
+        let handle = self.get_or_init_shared_memory()?;
+        let state = handle.get_state();
+
+        self.warn_if_stale_heartbeat(state, raw_device_index);
+
+        if let Some((used, limit)) = state.with_device(raw_device_index, |device| {
+            (
+                device.device_info.get_pod_memory_used(),
+                device.device_info.get_mem_limit(),
+            )
+        }) {
+            Ok((used, limit))
+        } else {
+            Err(Error::DeviceNotConfigured(format!(
+                "SHM device {raw_device_index}"
+            )))
+        }
+    }
+
+    /// Atomically reserve memory by incrementing pod_memory_used BEFORE calling the
+    /// native allocator. Returns Ok(previous_used) if the reservation fits within the
+    /// limit, or Err if it would exceed the limit (and rolls back the increment).
+    ///
+    /// This eliminates the TOCTOU race in the old check-then-allocate pattern: the
+    /// atomic fetch_add IS the reservation, so concurrent threads cannot both pass
+    /// the limit check with stale values.
+    ///
+    /// Under high contention with tight limits, multiple threads may each fetch_add
+    /// past the limit simultaneously and all roll back, causing under-utilization
+    /// (fewer successes than slots available). This is safe — conservative direction.
+    pub(crate) fn try_reserve(&self, device_idx: usize, size: u64) -> Result<u64, Error> {
+        if size == 0 {
+            return Ok(0);
+        }
+        // Guard against u64 overflow: fetch_add wraps modularly, so a huge size
+        // would corrupt pod_memory_used transiently until rollback. Any realistic
+        // GPU allocation is well under this threshold.
+        const MAX_ALLOC_SIZE: u64 = u64::MAX / 2;
+        if size > MAX_ALLOC_SIZE {
+            return Err(Error::OverLimit {
+                used: 0,
+                request: size,
+                limit: 0,
+                device_idx,
+            });
+        }
+        let handle = self.get_or_init_shared_memory()?;
+        let state = handle.get_state();
+
+        self.warn_if_stale_heartbeat(state, device_idx);
+
+        match self.atomic_reserve(state, device_idx, size) {
+            Ok(previous_used) => Ok(previous_used),
+            Err(e) => {
+                // Attempt to recover capacity by reaping dead processes. If any
+                // were reaped, retry the reservation once. This prevents permanent
+                // capacity loss when a sibling process is SIGKILL'd after our init.
+                if self.reap_dead_pids() > 0 {
+                    return self.atomic_reserve(
+                        self.get_or_init_shared_memory()?.get_state(),
+                        device_idx,
+                        size,
+                    );
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Atomically reserve `size` bytes on `device_idx` via fetch_add, rolling back
+    /// if the new total exceeds the limit.
+    ///
+    /// NOTE: Between the fetch_add and the potential rollback fetch_sub below,
+    /// pod_memory_used holds a transiently elevated value (actual_used + size).
+    /// A concurrent hipMemGetInfo reader may see slightly less free memory than
+    /// reality during this nanosecond-scale window. This is conservative (never
+    /// over-reports free memory) and acceptable for lock-free atomics.
+    fn atomic_reserve(
+        &self,
+        state: &SharedDeviceState,
+        device_idx: usize,
+        size: u64,
+    ) -> Result<u64, Error> {
+        // Read all three values atomically within a single with_device call:
+        // - fetch_add the reservation
+        // - get mem_limit (raw limit written during init)
+        // - get effective_mem_limit (limit minus non-hipMalloc overhead)
+        let reserve_result: Option<(u64, u64, u64)> = state.with_device(device_idx, |device| {
+            let previous_used = device
+                .device_info
+                .pod_memory_used
+                .fetch_add(size, Ordering::AcqRel);
+            let mem_limit = device.device_info.get_mem_limit();
+            let effective = device.device_info.get_effective_mem_limit();
+            (previous_used, mem_limit, effective)
+        });
+
+        let Some((previous_used, mem_limit, effective)) = reserve_result else {
+            return Err(Error::DeviceNotConfigured(format!(
+                "SHM device {device_idx}"
+            )));
+        };
+
+        // Use effective_mem_limit if it has been computed (non-zero), otherwise
+        // fall back to raw mem_limit (first 100 allocs before first reconciliation).
+        let active_limit = if effective > 0 { effective } else { mem_limit };
+        let new_used = previous_used.saturating_add(size);
+
+        if new_used > active_limit {
+            // Over limit — roll back the reservation
+            state.with_device(device_idx, |device| {
+                device
+                    .device_info
+                    .saturating_fetch_sub_pod_memory_used(size)
+            });
+            return Err(Error::OverLimit {
+                used: previous_used,
+                request: size,
+                limit: active_limit,
+                device_idx,
+            });
+        }
+
+        Ok(previous_used)
+    }
+
+    /// Roll back a reservation when the native allocator fails after try_reserve succeeded.
+    pub(crate) fn rollback_reservation(&self, device_idx: usize, size: u64) {
+        if size == 0 {
+            return;
+        }
+        let handle = match self.get_or_init_shared_memory() {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::warn!("Cannot rollback reservation, SHM unavailable: {error}");
+                return;
+            }
+        };
+        let state = handle.get_state();
+        state.with_device(device_idx, |device| {
+            device
+                .device_info
+                .saturating_fetch_sub_pod_memory_used(size)
+        });
+    }
+
+    /// Record a successful allocation in the pointer tracker (after try_reserve + native alloc).
+    /// The SHM pod_memory_used was already incremented by try_reserve.
+    pub(crate) fn record_allocation(&self, device_idx: usize, ptr: usize, size: u64) {
+        if size == 0 {
+            return;
+        }
+        self.allocation_tracker.insert(ptr, (device_idx, size));
+
+        if let Some(ref ps) = self.proc_slots {
+            ps.add_usage(device_idx, size);
+        }
+
+        // Periodic reconciliation: compare our counter with real VRAM usage
+        let count = self.alloc_count.fetch_add(1, Ordering::Relaxed);
+        if count.is_multiple_of(100) {
+            // Reap dead processes during reconciliation to keep effective_mem_limit
+            // tracking reality. Without this, stale proc slots from dead processes
+            // accumulate non_hip overhead that no longer exists on the GPU, causing
+            // the effective limit to be artificially conservative.
+            self.reap_dead_pids();
+            self.log_reconciliation(device_idx, count);
+        }
+    }
+
+    /// Reconciliation: compare our hipMalloc tracker with DRM fdinfo (real per-process VRAM),
+    /// compute non-hipMalloc overhead, and update the effective memory limit.
+    ///
+    /// Reads `/proc/self/fdinfo` once and updates overhead + effective_mem_limit for ALL
+    /// mapped devices, not just the triggering device. This ensures multi-GPU pods keep
+    /// all devices' effective limits fresh even if allocations concentrate on one device.
+    ///
+    /// Key metrics (logged for the triggering device):
+    /// - `tracked_bytes/tracked_count`: our hipMalloc accounting (per-process, authoritative)
+    /// - `drm_resident_mib`: real per-process VRAM from kernel DRM fdinfo (all sources)
+    /// - `non_hip_mib`: per-process overhead not from hipMalloc (compiled kernels, scratch, context)
+    /// - `total_overhead_mib`: sum of non_hip across ALL concurrent processes on this device
+    /// - `effective_limit_mib`: mem_limit minus total_overhead (what hipMalloc enforcement uses)
+    /// - `tracker_vs_slot_mib`: DashMap sum minus proc slot usage (should be 0; non-zero = accounting bug)
+    /// - `stale_mib`: at alloc_count=0, how much SHM was non-zero before this process started
+    /// - `cmdline`: process command line (logged at first alloc only)
+    fn log_reconciliation(&self, device_idx: usize, alloc_count: u64) {
+        let pid = std::process::id();
+
+        // Single fdinfo scan — returns per-BDF VRAM usage for all GPUs this process has open.
+        let drm_by_bdf = read_drm_resident_vram_all();
+
+        // Single DashMap pass — compute per-device tracked bytes for all devices.
+        let tracked_count = self.allocation_tracker.len();
+        let mut tracked_by_device = std::collections::HashMap::<usize, u64>::new();
+        for entry in self.allocation_tracker.iter() {
+            *tracked_by_device.entry(entry.value().0).or_insert(0) += entry.value().1;
+        }
+
+        // Update overhead + effective_mem_limit for ALL mapped devices (not just the trigger).
+        // This keeps multi-GPU pods fresh even if allocs concentrate on one device.
+        let mut trigger_drm_resident = 0u64;
+        let mut trigger_overhead_mib = 0u64;
+        let mut trigger_effective_mib = 0u64;
+        for &(idx, ref uuid) in &self.gpu_idx_uuids {
+            let bdf = normalize_uuid_to_bdf(uuid);
+            let drm_resident = drm_by_bdf.get(&bdf).copied().unwrap_or(0);
+            let tracked = tracked_by_device.get(&idx).copied().unwrap_or(0);
+            let non_hip_bytes = drm_resident.saturating_sub(tracked);
+            let mem_limit = self
+                .get_pod_memory_usage(idx)
+                .map(|(_, ml)| ml)
+                .unwrap_or(0);
+            let (overhead_mib, effective_mib) =
+                self.update_effective_limit(idx, non_hip_bytes, mem_limit);
+            if idx == device_idx {
+                trigger_drm_resident = drm_resident;
+                trigger_overhead_mib = overhead_mib;
+                trigger_effective_mib = effective_mib;
+            }
+        }
+
+        // --- Detailed logging for the triggering device only ---
+
+        let (pod_used, mem_limit) = self.get_pod_memory_usage(device_idx).unwrap_or((0, 0));
+
+        let tracked_bytes = tracked_by_device.get(&device_idx).copied().unwrap_or(0);
+        let drm_resident_mib = trigger_drm_resident / (1024 * 1024);
+        let non_hip_mib = trigger_drm_resident.saturating_sub(tracked_bytes) / (1024 * 1024);
+
+        let total_overhead_mib = trigger_overhead_mib;
+        let effective_limit_mib = trigger_effective_mib;
+
+        // Detect accounting bugs: compare our DashMap total with our proc slot usage.
+        let proc_slot_used = self
+            .proc_slots
+            .as_ref()
+            .and_then(|ps| {
+                ps.slot_idx()
+                    .map(|idx| ps.table().read_slot_usage(idx)[device_idx])
+            })
+            .unwrap_or(tracked_bytes);
+        let tracker_vs_slot_mib = (tracked_bytes as i128 - proc_slot_used as i128) / (1024 * 1024);
+
+        // First alloc: log initial state and detect stale SHM.
+        if alloc_count == 0 {
+            let stale = pod_used.saturating_sub(tracked_bytes);
+            let stale_mib = stale / (1024 * 1024);
+            if stale_mib > 0 {
+                tracing::warn!(
+                    pid,
+                    device_idx,
+                    drm_resident_mib,
+                    tracked_bytes,
+                    mem_limit,
+                    effective_limit_mib,
+                    total_overhead_mib,
+                    stale_mib,
+                    cmdline = self.process_cmdline,
+                    "STALE SHM: counter is {stale_mib} MiB above this process's tracked total \
+                     on first alloc — prior process(es) likely exited without drain"
+                );
+            } else {
+                tracing::info!(
+                    pid,
+                    device_idx,
+                    drm_resident_mib,
+                    tracked_bytes,
+                    mem_limit,
+                    effective_limit_mib,
+                    total_overhead_mib,
+                    cmdline = self.process_cmdline,
+                    "initial SHM state on first alloc"
+                );
+            }
+            return;
+        }
+
+        // WARN on accounting bug or dangerously high overhead.
+        let mem_limit_mib = mem_limit / (1024 * 1024);
+        let overhead_pct = if mem_limit_mib > 0 {
+            (total_overhead_mib * 100) / mem_limit_mib
+        } else {
+            0
+        };
+
+        if tracker_vs_slot_mib.abs() > 10 {
+            tracing::warn!(
+                pid,
+                alloc_count,
+                device_idx,
+                drm_resident_mib,
+                non_hip_mib,
+                tracked_bytes,
+                tracked_count,
+                tracker_vs_slot_mib,
+                effective_limit_mib,
+                total_overhead_mib,
+                mem_limit,
+                "ACCOUNTING DRIFT: tracker vs proc_slot = {tracker_vs_slot_mib} MiB \
+                 (expected ~0, non-zero indicates bug)"
+            );
+        } else if overhead_pct > 25 {
+            tracing::warn!(
+                pid,
+                alloc_count,
+                device_idx,
+                drm_resident_mib,
+                non_hip_mib,
+                tracked_bytes,
+                tracked_count,
+                effective_limit_mib,
+                total_overhead_mib,
+                overhead_pct,
+                "HIGH OVERHEAD: non-hipMalloc overhead is {overhead_pct}% of mem_limit \
+                 ({total_overhead_mib} MiB across all processes)"
+            );
+        } else {
+            tracing::info!(
+                pid,
+                alloc_count,
+                device_idx,
+                drm_resident_mib,
+                non_hip_mib,
+                tracked_bytes,
+                tracked_count,
+                effective_limit_mib,
+                total_overhead_mib,
+                "reconciliation"
+            );
+        }
+    }
+
+    /// Sum non-hipMalloc overhead across all active proc slots for a device and write
+    /// the resulting effective limit to SHM. Used by both reconciliation and reaping.
+    fn recalculate_effective_limit(
+        &self,
+        ps: &ProcSlotHandle,
+        state: &SharedDeviceState,
+        device_idx: usize,
+    ) {
+        let mem_limit = state
+            .with_device(device_idx, |device| device.device_info.get_mem_limit())
+            .unwrap_or(0);
+        if mem_limit == 0 {
+            return;
+        }
+        let total_overhead = ps.sum_non_hip_for_device(device_idx);
+        let effective = mem_limit.saturating_sub(total_overhead);
+        state.with_device(device_idx, |device| {
+            device.device_info.set_effective_mem_limit(effective);
+        });
+    }
+
+    /// Write this process's non-hipMalloc overhead to its proc slot, sum across all
+    /// active slots, and update the effective memory limit in SHM.
+    ///
+    /// Returns `(total_overhead_mib, effective_limit_mib)` for logging.
+    fn update_effective_limit(
+        &self,
+        device_idx: usize,
+        non_hip_bytes: u64,
+        mem_limit: u64,
+    ) -> (u64, u64) {
+        let Some(ref ps) = self.proc_slots else {
+            if non_hip_bytes > 0 {
+                tracing::warn!(
+                    non_hip_mib = non_hip_bytes / (1024 * 1024),
+                    "Overhead enforcement degraded: no proc slot available, \
+                     effective_mem_limit not updated"
+                );
+            }
+            return (0, mem_limit / (1024 * 1024));
+        };
+
+        // Write our overhead to our proc slot
+        ps.write_non_hip(device_idx, non_hip_bytes);
+
+        // Recalculate effective limit from all active slots
+        if let Ok(handle) = self.get_or_init_shared_memory() {
+            self.recalculate_effective_limit(ps, handle.get_state(), device_idx);
+        }
+
+        let total_overhead = ps.sum_non_hip_for_device(device_idx);
+        let total_overhead_mib = total_overhead / (1024 * 1024);
+        let effective_mib = mem_limit.saturating_sub(total_overhead) / (1024 * 1024);
+        (total_overhead_mib, effective_mib)
+    }
+
+    /// Record a free: look up the pointer's size, decrement SHM pod_memory_used.
+    /// Returns true if the pointer was tracked (and decremented), false if unknown.
+    /// Remove a tracked allocation from the DashMap without touching SHM.
+    /// Returns `(device_idx, size)` if the pointer was tracked.
+    ///
+    /// Called by `check_and_free!` BEFORE the native free to prevent ABA races:
+    /// if hipFree releases an address before we remove the DashMap entry, another
+    /// thread's hipMalloc can reuse that address and overwrite our entry.
+    pub(crate) fn take_tracked_allocation(&self, ptr: usize) -> Option<(usize, u64)> {
+        self.allocation_tracker
+            .remove(&ptr)
+            .map(|(_, (device_idx, size))| (device_idx, size))
+    }
+
+    /// Re-insert a tracked allocation (used when native free fails after take).
+    pub(crate) fn restore_tracked_allocation(&self, ptr: usize, device_idx: usize, size: u64) {
+        self.allocation_tracker.insert(ptr, (device_idx, size));
+    }
+
+    /// Decrement SHM and proc slot counters for a freed allocation.
+    /// Called by `check_and_free!` AFTER native free succeeds.
+    pub(crate) fn finalize_free(&self, device_idx: usize, size: u64) {
+        match self.get_or_init_shared_memory() {
+            Ok(handle) => {
+                let state = handle.get_state();
+                state.with_device(device_idx, |device| {
+                    device
+                        .device_info
+                        .saturating_fetch_sub_pod_memory_used(size)
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    size = size,
+                    device_idx = device_idx,
+                    "Cannot finalize free, SHM unavailable: {error}"
+                );
+            }
+        }
+
+        if let Some(ref ps) = self.proc_slots {
+            ps.sub_usage(device_idx, size);
+        }
+    }
+
+    /// Drain all tracked allocations and decrement SHM counters.
+    /// Called at process exit (via `libc::atexit`) to prevent stale
+    /// `pod_memory_used` accumulation across sequential processes sharing
+    /// the same SHM segment.
+    ///
+    /// Aggregates per-device totals from the DashMap, then does one bulk
+    /// `saturating_fetch_sub` per device (avoids N atomic ops for N allocations).
+    ///
+    /// Uses `eprintln` instead of `tracing` because Rust's TLS destructors
+    /// may have already run by the time `atexit` fires, making the tracing
+    /// subscriber inaccessible.
+    pub(crate) fn drain_allocations(&self) {
+        let pid = std::process::id();
+        let handle = match self.shared_memory_handle.get() {
+            Some(handle) => handle,
+            None => return, // SHM was never initialized — nothing to drain
+        };
+
+        // Aggregate per-device totals
+        let mut device_totals: std::collections::HashMap<usize, u64> =
+            std::collections::HashMap::new();
+        // Drain the tracker — removes all entries
+        self.allocation_tracker.retain(|_, (device_idx, size)| {
+            *device_totals.entry(*device_idx).or_default() += *size;
+            false // remove every entry
+        });
+
+        if device_totals.is_empty() {
+            return;
+        }
+
+        let state = handle.get_state();
+
+        // Snapshot SHM before drain, drain, then snapshot after — shows the effect
+        let mut drain_details: Vec<String> = Vec::new();
+        for (device_idx, total_size) in &device_totals {
+            let before = state
+                .with_device(*device_idx, |device| {
+                    device.device_info.get_pod_memory_used()
+                })
+                .unwrap_or(0);
+            state.with_device(*device_idx, |device| {
+                device
+                    .device_info
+                    .saturating_fetch_sub_pod_memory_used(*total_size)
+            });
+            let after = state
+                .with_device(*device_idx, |device| {
+                    device.device_info.get_pod_memory_used()
+                })
+                .unwrap_or(0);
+            drain_details.push(format!(
+                "dev{device_idx}: drained {} MiB (shm: {} -> {} MiB)",
+                total_size / (1024 * 1024),
+                before / (1024 * 1024),
+                after / (1024 * 1024),
+            ));
+        }
+
+        let total_bytes: u64 = device_totals.values().sum();
+        let alloc_count = self.alloc_count.load(Ordering::Relaxed);
+        eprintln!(
+            "[hipflex] drain (pid {pid}): {total_bytes} bytes ({} MiB), \
+             {alloc_count} allocs tracked this process: [{}]",
+            total_bytes / (1024 * 1024),
+            drain_details.join(", ")
+        );
+
+        // Release our proc slot. The return value (per-device usage snapshot) is
+        // intentionally unused: pod_memory_used was already subtracted above via
+        // the DashMap aggregation, which is the authoritative accounting path.
+        // The proc slot is purely for reaping dead processes.
+        if let Some(ref ps) = self.proc_slots {
+            let _ = ps.drain_our_slot();
+        }
+    }
+
+    /// Scan proc slots for dead PIDs and subtract their usage from pod_memory_used.
+    ///
+    /// Called during standalone init (before first allocation) and on OOM
+    /// (when `try_reserve` fails, to recover capacity from dead processes).
+    /// Uses CAS-based slot claiming internally, so concurrent calls are safe.
+    pub(crate) fn reap_dead_pids(&self) -> usize {
+        let Some(ref ps) = self.proc_slots else {
+            return 0;
+        };
+        let handle = match self.shared_memory_handle.get() {
+            Some(h) => h,
+            None => return 0,
+        };
+        let state = handle.get_state();
+        let reaped = ps.reap_dead();
+
+        for (dead_pid, usage) in &reaped {
+            for (device_idx, &bytes) in usage.iter().enumerate() {
+                if bytes > 0 {
+                    state.with_device(device_idx, |device| {
+                        device
+                            .device_info
+                            .saturating_fetch_sub_pod_memory_used(bytes)
+                    });
+                    tracing::info!(
+                        dead_pid,
+                        device_idx,
+                        mib = bytes / (1024 * 1024),
+                        "Reaped dead process: subtracted usage from pod_memory_used"
+                    );
+                }
+            }
+        }
+
+        if !reaped.is_empty() {
+            tracing::info!(
+                pid = std::process::id(),
+                count = reaped.len(),
+                "Reaped dead process(es) from proc slots"
+            );
+
+            // Recalculate effective limits for ALL mapped devices. Reaped slots may have
+            // had non_hip overhead on devices where they had zero hipMalloc usage, so we
+            // can't rely on the `used` array to determine which devices are affected.
+            for &(device_idx, _) in &self.gpu_idx_uuids {
+                self.recalculate_effective_limit(ps, state, device_idx);
+            }
+        }
+
+        reaped.len()
+    }
+
+    pub(crate) fn isolation(&self) -> Option<&str> {
+        self.isolation.as_deref()
+    }
+
+    /// Match a PCI BDF string (e.g., "0000:75:00.0") against configured devices.
+    /// Used by amdsmi hooks to resolve opaque processor handles to SHM device indices.
+    pub(crate) fn device_index_by_pci_bdf(&self, bdf: &str) -> Result<usize, Error> {
+        let bdf_lower = bdf.to_lowercase();
+        for (idx, uuid) in &self.gpu_idx_uuids {
+            if normalize_uuid_to_bdf(uuid) == bdf_lower {
+                return Ok(*idx);
+            }
+        }
+        Err(Error::DeviceNotConfigured(format!("BDF {bdf}")))
+    }
+
+    /// hipflex always enforces memory limits, so hooks are never skipped.
+    pub(crate) fn all_devices_unlimited(&self) -> bool {
+        false
+    }
+}
+
+fn shm_path() -> PathBuf {
+    PathBuf::from(crate::resolve_shm_path())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use hipflex_internal::shared_memory::SharedDeviceInfo;
+
+    trait SharedMemory {
+        fn get_state(&self) -> &SharedDeviceInfo;
+    }
+
+    pub struct MockSharedMemory {
+        state: Arc<SharedDeviceInfo>,
+    }
+
+    impl MockSharedMemory {
+        pub fn new(mem_limit: u64) -> Self {
+            let state = Arc::new(SharedDeviceInfo::new(mem_limit));
+            Self { state }
+        }
+
+        pub fn set_pod_memory_used(&self, used: u64) {
+            self.state.set_pod_memory_used(used);
+        }
+    }
+
+    impl SharedMemory for MockSharedMemory {
+        fn get_state(&self) -> &SharedDeviceInfo {
+            &self.state
+        }
+    }
+
+    /// Smoke test: verify get/set on SharedDeviceInfo and free = limit - used.
+    #[test]
+    fn test_memory_info_reporting() {
+        let mock = MockSharedMemory::new(1024 * 1024 * 1024);
+        mock.set_pod_memory_used(512 * 1024 * 1024);
+
+        let state = mock.get_state();
+        let total = state.get_mem_limit();
+        let used = state.get_pod_memory_used();
+        let free = total.saturating_sub(used);
+
+        assert_eq!(total, 1024 * 1024 * 1024);
+        assert_eq!(used, 512 * 1024 * 1024);
+        assert_eq!(free, 512 * 1024 * 1024);
+    }
+
+    /// Edge case: saturating_sub prevents underflow when used >= limit.
+    #[test]
+    fn test_memory_info_edge_cases() {
+        let mock = MockSharedMemory::new(1024);
+        mock.set_pod_memory_used(1024);
+
+        let state = mock.get_state();
+        let total = state.get_mem_limit();
+        let used = state.get_pod_memory_used();
+        let free = total.saturating_sub(used);
+
+        assert_eq!(free, 0);
+
+        // When used exceeds total, saturating_sub prevents underflow
+        mock.set_pod_memory_used(2048);
+        let used = state.get_pod_memory_used();
+        let free = total.saturating_sub(used);
+        assert_eq!(free, 0);
+    }
+
+    // --- UUID normalization tests ---
+    //
+    // Real formats from production:
+    //   HIP runtime returns:     "0000:75:00.0" (lowercase hex, domain:bus:device.function)
+    //   Config generation:         strings.ToLower("AMD-GPU-" + BDF) = "amd-gpu-0000:75:00.0"
+    //   C provider uses:          snprintf("AMD-GPU-%04x:%02x:%02x.%x") = "AMD-GPU-0000:75:00.0"
+    //
+    // The normalizer must handle all three sources.
+
+    #[test]
+    fn test_normalize_uuid_strips_lowercase_prefix() {
+        // Config format (always lowercase)
+        assert_eq!(
+            super::normalize_uuid_to_bdf("amd-gpu-0000:75:00.0"),
+            "0000:75:00.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uuid_strips_uppercase_prefix() {
+        // C provider format (uppercase prefix, lowercase hex)
+        assert_eq!(
+            super::normalize_uuid_to_bdf("AMD-GPU-0000:75:00.0"),
+            "0000:75:00.0"
+        );
+    }
+
+    #[test]
+    fn test_normalize_uuid_bare_bdf() {
+        // Raw PCI bus ID as HIP returns it
+        assert_eq!(super::normalize_uuid_to_bdf("0000:75:00.0"), "0000:75:00.0");
+    }
+
+    #[test]
+    fn test_normalize_uuid_mixed_case_hex() {
+        // Hypothetical: uppercase hex digits in bus ID
+        assert_eq!(
+            super::normalize_uuid_to_bdf("AMD-GPU-0000:F5:00.0"),
+            "0000:f5:00.0"
+        );
+    }
+
+    // --- Device resolution tests ---
+    //
+    // Uses real MI325X PCI bus IDs from production 8-GPU node:
+    //   Device 0: 0000:75:00.0    Device 4: 0000:f5:00.0
+    //   Device 1: 0000:05:00.0    Device 5: 0000:85:00.0
+    //   Device 2: 0000:65:00.0    Device 6: 0000:e5:00.0
+    //   Device 3: 0000:15:00.0    Device 7: 0000:95:00.0
+
+    fn devices(pairs: &[(i32, &str)]) -> Vec<(i32, String)> {
+        pairs.iter().map(|(i, s)| (*i, s.to_string())).collect()
+    }
+
+    fn uuids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Real MI325X 8-GPU enumeration
+    fn mi325x_devices() -> Vec<(i32, String)> {
+        devices(&[
+            (0, "0000:75:00.0"),
+            (1, "0000:05:00.0"),
+            (2, "0000:65:00.0"),
+            (3, "0000:15:00.0"),
+            (4, "0000:f5:00.0"),
+            (5, "0000:85:00.0"),
+            (6, "0000:e5:00.0"),
+            (7, "0000:95:00.0"),
+        ])
+    }
+
+    #[test]
+    fn test_resolve_picks_correct_gpus_on_mi325x() {
+        // Pod allocated GPUs 0 and 4 (PCI slots 75 and f5)
+        let config = uuids(&["amd-gpu-0000:75:00.0", "amd-gpu-0000:f5:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].0, 0); // device 0 = 0000:75:00.0
+        assert_eq!(result[1].0, 4); // device 4 = 0000:f5:00.0
+    }
+
+    #[test]
+    fn test_resolve_single_gpu_allocation() {
+        // Pod allocated only GPU 3 (PCI slot 15)
+        let config = uuids(&["amd-gpu-0000:15:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 3);
+    }
+
+    #[test]
+    fn test_resolve_all_8_gpus() {
+        // Pod allocated all 8 GPUs
+        let config = uuids(&[
+            "amd-gpu-0000:75:00.0",
+            "amd-gpu-0000:05:00.0",
+            "amd-gpu-0000:65:00.0",
+            "amd-gpu-0000:15:00.0",
+            "amd-gpu-0000:f5:00.0",
+            "amd-gpu-0000:85:00.0",
+            "amd-gpu-0000:e5:00.0",
+            "amd-gpu-0000:95:00.0",
+        ]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 8);
+        // Should be sorted by device index
+        let indices: Vec<usize> = result.iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(indices, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn test_resolve_c_provider_format() {
+        // C provider uses uppercase prefix: "AMD-GPU-0000:75:00.0"
+        let config = uuids(&["AMD-GPU-0000:85:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 5); // device 5 = 0000:85:00.0
+    }
+
+    #[test]
+    fn test_resolve_missing_uuid_skipped() {
+        // One real device, one that doesn't exist on this node
+        let config = uuids(&["amd-gpu-0000:75:00.0", "amd-gpu-0000:aa:00.0"]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, 0);
+    }
+
+    #[test]
+    fn test_resolve_empty_config() {
+        let result = super::resolve_device_indices(&uuids(&[]), &mi325x_devices());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_empty_enumerated() {
+        let config = uuids(&["amd-gpu-0000:75:00.0"]);
+        let result = super::resolve_device_indices(&config, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_resolve_sorted_regardless_of_config_order() {
+        // Config lists devices in reverse order; result should still be sorted by index
+        let config = uuids(&[
+            "amd-gpu-0000:95:00.0", // device 7
+            "amd-gpu-0000:05:00.0", // device 1
+            "amd-gpu-0000:e5:00.0", // device 6
+        ]);
+        let result = super::resolve_device_indices(&config, &mi325x_devices());
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].0, 1); // device 1
+        assert_eq!(result[1].0, 6); // device 6
+        assert_eq!(result[2].0, 7); // device 7
+    }
+
+    #[test]
+    fn test_resolve_device_indices_bdf_match() {
+        let result = super::resolve_device_indices(
+            &uuids(&["amd-gpu-0000:75:00.0", "amd-gpu-0000:f5:00.0"]),
+            &mi325x_devices(),
+        );
+        assert_eq!(result.len(), 2);
+
+        let bdf = "0000:75:00.0";
+        let bdf_lower = bdf.to_lowercase();
+        let found = result
+            .iter()
+            .find(|(_, uuid)| super::normalize_uuid_to_bdf(uuid) == bdf_lower);
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().0, 0);
+    }
+
+    #[test]
+    fn test_resolve_device_indices_bdf_no_match() {
+        let result =
+            super::resolve_device_indices(&uuids(&["amd-gpu-0000:75:00.0"]), &mi325x_devices());
+        let bdf = "0000:aa:00.0";
+        let bdf_lower = bdf.to_lowercase();
+        let found = result
+            .iter()
+            .find(|(_, uuid)| super::normalize_uuid_to_bdf(uuid) == bdf_lower);
+        assert!(found.is_none());
+    }
+
+    // --- BDF formatting tests (amdsmi bitfield → PCI bus ID string) ---
+    //
+    // amdsmi_bdf_t layout: function(3) | device(5) | bus(8) | domain(48)
+    // Verified against MI325X empirical data.
+
+    #[test]
+    fn test_format_amdsmi_bdf_mi325x_device() {
+        // MI325X GPU at 0000:75:00.0 → raw = 0x7500
+        use crate::detour::smi::format_amdsmi_bdf;
+        assert_eq!(format_amdsmi_bdf(0x0000000000007500), "0000:75:00.0");
+    }
+
+    #[test]
+    fn test_format_amdsmi_bdf_high_bus() {
+        // MI325X GPU at 0000:f5:00.0 → raw = 0xf500
+        use crate::detour::smi::format_amdsmi_bdf;
+        assert_eq!(format_amdsmi_bdf(0x000000000000f500), "0000:f5:00.0");
+    }
+
+    #[test]
+    fn test_format_amdsmi_bdf_with_function() {
+        // Device with function number 3: 0000:05:01.3
+        use crate::detour::smi::format_amdsmi_bdf;
+        let raw: u64 = 3 | (1 << 3) | (0x05 << 8);
+        assert_eq!(format_amdsmi_bdf(raw), "0000:05:01.3");
+    }
+
+    #[test]
+    fn test_format_amdsmi_bdf_nonzero_domain() {
+        // Multi-domain system: 0001:75:00.0
+        use crate::detour::smi::format_amdsmi_bdf;
+        let raw: u64 = (0x75 << 8) | (1u64 << 16);
+        assert_eq!(format_amdsmi_bdf(raw), "0001:75:00.0");
+    }
+}
