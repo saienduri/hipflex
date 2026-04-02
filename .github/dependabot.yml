@@ -1,0 +1,26 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    assignees:
+      - saienduri
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    assignees:
+      - saienduri
+  - package-ecosystem: rust-toolchain
+    directory: /
+    schedule:
+      interval: weekly
+    assignees:
+      - saienduri
+  - package-ecosystem: docker
+    directory: /tests/gpu-tests
+    schedule:
+      interval: weekly
+    assignees:
+      - saienduri

@@ -1,0 +1,69 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'  # First day of each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Run tests
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build and release
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release -p hipflex
+
+      - name: Generate release tag
+        id: tag
+        run: echo "tag=v0.1.0-$(date +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Compute SHA256
+        id: sha
+        run: echo "sha256=$(sha256sum target/release/libhipflex.so | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.tag.outputs.tag }}"
+          SHA="${{ steps.sha.outputs.sha256 }}"
+
+          NOTES="$(cat <<EOF
+          ## hipflex $TAG
+
+          Built from \`${GITHUB_SHA::8}\` on $(date -u +%Y-%m-%d).
+
+          ### Usage
+
+          \`\`\`bash
+          FH_MEMORY_LIMIT=4GiB LD_PRELOAD=./libhipflex.so python3 train.py
+          \`\`\`
+
+          ### SHA256
+
+          \`\`\`
+          $SHA  libhipflex.so
+          \`\`\`
+          EOF
+          )"
+
+          if gh release view "$TAG" &>/dev/null; then
+            gh release upload "$TAG" target/release/libhipflex.so --clobber
+            gh release edit "$TAG" --notes "$NOTES"
+          else
+            gh release create "$TAG" target/release/libhipflex.so \
+              --title "$TAG" \
+              --notes "$NOTES"
+          fi
