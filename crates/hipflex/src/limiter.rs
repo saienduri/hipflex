@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use hipflex_internal::shared_memory::{handle::SharedMemoryHandle, SharedDeviceSt
 use once_cell::sync::OnceCell;
 
 use crate::hiplib::{self, HipDevice, HipError};
+use crate::kfd;
 
 /// Isolation mode that activates memory enforcement hooks.
 pub(crate) const ISOLATION_SOFT: &str = "soft";
@@ -55,6 +57,11 @@ pub(crate) struct Limiter {
     proc_slots: Option<ProcSlotHandle>,
     /// Process command line for diagnostics (from /proc/self/cmdline at init).
     process_cmdline: String,
+    /// KFD GPU devices for per-process VRAM reads (reconciliation).
+    kfd_devices: Vec<kfd::GpuDevice>,
+    /// Host PID for KFD sysfs VRAM reads. In containers, this differs from `getpid()`
+    /// and is resolved via `/host/proc` NSpid scanning. `None` = overhead tracking disabled.
+    host_pid: Option<u32>,
 }
 
 impl std::fmt::Debug for Limiter {
@@ -130,55 +137,16 @@ fn read_process_cmdline() -> String {
     }
 }
 
-/// Read DRM fdinfo from `/proc/self/fdinfo/*` in a single pass and return
-/// `drm-resident-vram` in bytes, keyed by PCI BDF (from `drm-pdev:` line).
-///
-/// Each open fd to a DRM render node includes a `drm-pdev:` line identifying which GPU
-/// it belongs to. We bucket VRAM by BDF so callers can look up per-device usage without
-/// re-scanning fdinfo for each GPU.
-///
-/// Fds without a `drm-pdev:` line are skipped (non-DRM fds).
-fn read_drm_resident_vram_all() -> std::collections::HashMap<String, u64> {
-    let mut by_bdf: std::collections::HashMap<String, u64> = std::collections::HashMap::new();
-    let entries = match std::fs::read_dir("/proc/self/fdinfo") {
-        Ok(entries) => entries,
-        Err(_) => return by_bdf,
-    };
-    for entry in entries.flatten() {
-        let content = match std::fs::read_to_string(entry.path()) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        // Extract BDF from drm-pdev line
-        let mut bdf = None;
-        let mut vram_bytes: u64 = 0;
-        for line in content.lines() {
-            if let Some(rest) = line.strip_prefix("drm-pdev:") {
-                bdf = Some(rest.trim().to_string());
-            } else if let Some(rest) = line.strip_prefix("drm-resident-vram:") {
-                let rest = rest.trim();
-                if let Some(kib_str) = rest.strip_suffix(" KiB") {
-                    if let Ok(kib) = kib_str.trim().parse::<u64>() {
-                        vram_bytes += kib * 1024;
-                    }
-                }
-            }
-        }
-        if let Some(bdf) = bdf {
-            *by_bdf.entry(bdf).or_insert(0) += vram_bytes;
-        }
-    }
-    by_bdf
-}
-
 impl Limiter {
     /// `pre_enumerated`: devices from sysfs; when `Some`, skips HIP runtime calls (fork-safe).
+    /// `kfd_devices`: GPU devices from KFD sysfs, used for per-process VRAM reads.
     pub(crate) fn new(
         mut gpu_uuids: Vec<String>,
         isolation: Option<String>,
         standalone: bool,
         proc_slots: Option<ProcSlotHandle>,
         pre_enumerated: Option<Vec<EnumeratedDevice>>,
+        kfd_devices: Vec<kfd::GpuDevice>,
     ) -> Result<Self, Error> {
         gpu_uuids.sort();
         gpu_uuids.dedup();
@@ -201,6 +169,24 @@ impl Limiter {
 
         let process_cmdline = read_process_cmdline();
 
+        let host_pid = kfd::resolve_host_pid(&kfd_devices);
+        let container_pid = std::process::id();
+        if let Some(hpid) = host_pid {
+            if hpid != container_pid {
+                tracing::info!(
+                    container_pid,
+                    host_pid = hpid,
+                    "Resolved host PID via /host/proc NSpid translation"
+                );
+            }
+        } else if !kfd_devices.is_empty() {
+            tracing::warn!(
+                container_pid,
+                "Could not resolve host PID — overhead tracking disabled. \
+                 Mount host procfs with -v /proc:/host/proc:ro to enable."
+            );
+        }
+
         tracing::info!(
             cmdline = process_cmdline,
             "Limiter initialized with GPU UUIDs and indices: {:?}",
@@ -217,6 +203,8 @@ impl Limiter {
             alloc_count: AtomicU64::new(0),
             proc_slots,
             process_cmdline,
+            kfd_devices,
+            host_pid,
         })
     }
 
@@ -455,16 +443,21 @@ impl Limiter {
         }
     }
 
-    /// Reconciliation: compare our hipMalloc tracker with DRM fdinfo (real per-process VRAM),
+    /// Reconciliation: compare our hipMalloc tracker with KFD sysfs (real per-process VRAM),
     /// compute non-hipMalloc overhead, and update the effective memory limit.
     ///
-    /// Reads `/proc/self/fdinfo` once and updates overhead + effective_mem_limit for ALL
-    /// mapped devices, not just the triggering device. This ensures multi-GPU pods keep
-    /// all devices' effective limits fresh even if allocations concentrate on one device.
+    /// Reads KFD sysfs (`/sys/class/kfd/kfd/proc/<host_pid>/vram_<gpu_id>`) for per-process
+    /// per-GPU physical VRAM and updates overhead + effective_mem_limit for ALL mapped devices,
+    /// not just the triggering device. This ensures multi-GPU pods keep all devices' effective
+    /// limits fresh even if allocations concentrate on one device.
+    ///
+    /// KFD sysfs uses host PIDs, so in containers the host PID must be resolved at init via
+    /// `/host/proc` NSpid scanning (see `resolve_host_pid`). If resolution failed, overhead
+    /// tracking is disabled and effective_mem_limit stays at mem_limit.
     ///
     /// Key metrics (logged for the triggering device):
     /// - `tracked_bytes/tracked_count`: our hipMalloc accounting (per-process, authoritative)
-    /// - `drm_resident_mib`: real per-process VRAM from kernel DRM fdinfo (all sources)
+    /// - `vram_resident_mib`: real per-process physical VRAM from KFD sysfs
     /// - `non_hip_mib`: per-process overhead not from hipMalloc (compiled kernels, scratch, context)
     /// - `total_overhead_mib`: sum of non_hip across ALL concurrent processes on this device
     /// - `effective_limit_mib`: mem_limit minus total_overhead (what hipMalloc enforcement uses)
@@ -474,26 +467,31 @@ impl Limiter {
     fn log_reconciliation(&self, device_idx: usize, alloc_count: u64) {
         let pid = std::process::id();
 
-        // Single fdinfo scan — returns per-BDF VRAM usage for all GPUs this process has open.
-        let drm_by_bdf = read_drm_resident_vram_all();
+        // KFD sysfs — accurate per-process per-GPU physical VRAM.
+        // Uses host_pid (resolved at init) since KFD sysfs is not PID-namespace-aware.
+        // Returns empty if host_pid is None (overhead tracking disabled).
+        let vram_by_bdf = match self.host_pid {
+            Some(hpid) => kfd::read_kfd_vram_for_pid(hpid, &self.kfd_devices),
+            None => HashMap::new(),
+        };
 
         // Single DashMap pass — compute per-device tracked bytes for all devices.
         let tracked_count = self.allocation_tracker.len();
-        let mut tracked_by_device = std::collections::HashMap::<usize, u64>::new();
+        let mut tracked_by_device = HashMap::<usize, u64>::new();
         for entry in self.allocation_tracker.iter() {
             *tracked_by_device.entry(entry.value().0).or_insert(0) += entry.value().1;
         }
 
         // Update overhead + effective_mem_limit for ALL mapped devices (not just the trigger).
         // This keeps multi-GPU pods fresh even if allocs concentrate on one device.
-        let mut trigger_drm_resident = 0u64;
+        let mut trigger_vram_resident = 0u64;
         let mut trigger_overhead_mib = 0u64;
         let mut trigger_effective_mib = 0u64;
         for &(idx, ref uuid) in &self.gpu_idx_uuids {
             let bdf = normalize_uuid_to_bdf(uuid);
-            let drm_resident = drm_by_bdf.get(&bdf).copied().unwrap_or(0);
+            let vram_resident = vram_by_bdf.get(&bdf).copied().unwrap_or(0);
             let tracked = tracked_by_device.get(&idx).copied().unwrap_or(0);
-            let non_hip_bytes = drm_resident.saturating_sub(tracked);
+            let non_hip_bytes = vram_resident.saturating_sub(tracked);
             let mem_limit = self
                 .get_pod_memory_usage(idx)
                 .map(|(_, ml)| ml)
@@ -501,7 +499,7 @@ impl Limiter {
             let (overhead_mib, effective_mib) =
                 self.update_effective_limit(idx, non_hip_bytes, mem_limit);
             if idx == device_idx {
-                trigger_drm_resident = drm_resident;
+                trigger_vram_resident = vram_resident;
                 trigger_overhead_mib = overhead_mib;
                 trigger_effective_mib = effective_mib;
             }
@@ -512,8 +510,8 @@ impl Limiter {
         let (pod_used, mem_limit) = self.get_pod_memory_usage(device_idx).unwrap_or((0, 0));
 
         let tracked_bytes = tracked_by_device.get(&device_idx).copied().unwrap_or(0);
-        let drm_resident_mib = trigger_drm_resident / (1024 * 1024);
-        let non_hip_mib = trigger_drm_resident.saturating_sub(tracked_bytes) / (1024 * 1024);
+        let vram_resident_mib = trigger_vram_resident / (1024 * 1024);
+        let non_hip_mib = trigger_vram_resident.saturating_sub(tracked_bytes) / (1024 * 1024);
 
         let total_overhead_mib = trigger_overhead_mib;
         let effective_limit_mib = trigger_effective_mib;
@@ -537,7 +535,7 @@ impl Limiter {
                 tracing::warn!(
                     pid,
                     device_idx,
-                    drm_resident_mib,
+                    vram_resident_mib,
                     tracked_bytes,
                     mem_limit,
                     effective_limit_mib,
@@ -551,7 +549,7 @@ impl Limiter {
                 tracing::info!(
                     pid,
                     device_idx,
-                    drm_resident_mib,
+                    vram_resident_mib,
                     tracked_bytes,
                     mem_limit,
                     effective_limit_mib,
@@ -576,7 +574,7 @@ impl Limiter {
                 pid,
                 alloc_count,
                 device_idx,
-                drm_resident_mib,
+                vram_resident_mib,
                 non_hip_mib,
                 tracked_bytes,
                 tracked_count,
@@ -592,7 +590,7 @@ impl Limiter {
                 pid,
                 alloc_count,
                 device_idx,
-                drm_resident_mib,
+                vram_resident_mib,
                 non_hip_mib,
                 tracked_bytes,
                 tracked_count,
@@ -607,7 +605,7 @@ impl Limiter {
                 pid,
                 alloc_count,
                 device_idx,
-                drm_resident_mib,
+                vram_resident_mib,
                 non_hip_mib,
                 tracked_bytes,
                 tracked_count,
@@ -738,8 +736,7 @@ impl Limiter {
         };
 
         // Aggregate per-device totals
-        let mut device_totals: std::collections::HashMap<usize, u64> =
-            std::collections::HashMap::new();
+        let mut device_totals: HashMap<usize, u64> = HashMap::new();
         // Drain the tracker — removes all entries
         self.allocation_tracker.retain(|_, (device_idx, size)| {
             *device_totals.entry(*device_idx).or_default() += *size;

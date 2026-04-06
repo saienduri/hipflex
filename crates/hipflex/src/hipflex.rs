@@ -154,6 +154,8 @@ struct StandaloneConfig {
     proc_slots: ProcSlotHandle,
     /// Devices from sysfs enumeration; `None` when HIP runtime was used as fallback.
     pre_enumerated: Option<Vec<limiter::EnumeratedDevice>>,
+    /// KFD GPU devices for per-process VRAM reads in reconciliation.
+    kfd_devices: Vec<kfd::GpuDevice>,
 }
 
 /// Build a BDF+DeviceConfig pair from a device index and PCI bus ID.
@@ -184,7 +186,7 @@ fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, Strin
     // In K8s, GPU restriction is via /dev/dri/renderD* mounting (handled by sysfs
     // render device check). The post-init verification will log an error if the
     // sysfs device list diverges from HIP's view.
-    let (gpu_uuids, configs, pre_enumerated) = match kfd::enumerate_gpu_devices() {
+    let (gpu_uuids, configs, pre_enumerated, kfd_devices) = match kfd::enumerate_gpu_devices() {
         Ok(devices) => {
             tracing::info!(
                 device_count = devices.len(),
@@ -200,7 +202,8 @@ fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, Strin
                 uuids.push(uuid);
                 cfgs.push(config);
             }
-            (uuids, cfgs, Some(enumerated))
+            let kfd_devs = devices;
+            (uuids, cfgs, Some(enumerated), kfd_devs)
         }
         Err(e) => {
             tracing::warn!("KFD sysfs enumeration failed ({e}), falling back to HIP runtime");
@@ -224,7 +227,7 @@ fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, Strin
                 uuids.push(uuid);
                 cfgs.push(config);
             }
-            (uuids, cfgs, None)
+            (uuids, cfgs, None, Vec::new())
         }
     };
 
@@ -255,6 +258,7 @@ fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, Strin
         shm_handle,
         proc_slots,
         pre_enumerated,
+        kfd_devices,
     })
 }
 
@@ -284,7 +288,7 @@ fn init_limiter() {
         }
 
         // Config priority: FH_MEMORY_LIMIT (standalone) > FH_SHM_FILE (mock).
-        let (config, standalone_shm, proc_slots, pre_enumerated) =
+        let (config, standalone_shm, proc_slots, pre_enumerated, kfd_devices) =
             if let Ok(mem_limit_str) = env::var("FH_MEMORY_LIMIT") {
                 match init_standalone_config(&mem_limit_str) {
                     Ok(sc) => (
@@ -292,6 +296,7 @@ fn init_limiter() {
                         Some(sc.shm_handle),
                         Some(sc.proc_slots),
                         sc.pre_enumerated,
+                        sc.kfd_devices,
                     ),
                     Err(e) => {
                         record_limiter_error(e);
@@ -300,7 +305,7 @@ fn init_limiter() {
                 }
             } else {
                 match init_mock_config() {
-                    Ok(config) => (config, None, None, None),
+                    Ok(config) => (config, None, None, None, Vec::new()),
                     Err(e) => {
                         record_limiter_error(e);
                         return;
@@ -327,6 +332,7 @@ fn init_limiter() {
             is_standalone,
             proc_slots,
             pre_enumerated,
+            kfd_devices,
         ) {
             Ok(limiter) => limiter,
             Err(error) => {

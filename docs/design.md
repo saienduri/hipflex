@@ -73,18 +73,18 @@ The under-utilization window (between reserve and native call) is bounded by one
 
 **Free path** uses conservative ordering: call native free first, then decrement SHM via `saturating_fetch_sub`. A crash between free and decrement causes over-reporting (safe direction — prevents overcommit, never allows silent over-allocation).
 
-## DRM-Aware Overhead Tracking
+## KFD Sysfs Overhead Tracking
 
 Not all GPU VRAM usage goes through HIP allocation APIs. The ROCm runtime stack and kernel driver allocate memory for code objects, scratch buffers, page tables, and HSA state that is invisible to the limiter's hooks. On MI325X with PyTorch workloads, this overhead ranges from 3.5–9 GiB per process.
 
 **How it works:**
 
-1. **DRM fdinfo measurement** — `read_drm_resident_vram_all()` reads `/proc/self/fdinfo` to get the kernel's view of per-BDF resident VRAM for the current process.
-2. **Overhead calculation** — For each mapped device: `non_hip_bytes = drm_resident - tracked_hipMalloc`.
+1. **KFD sysfs measurement** — `read_kfd_vram_for_pid()` reads `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` to get per-process per-GPU physical VRAM from the kernel.
+2. **Overhead calculation** — For each mapped device: `non_hip_bytes = vram_resident - tracked_hipMalloc`.
 3. **Per-process proc_slots** — Each process writes its per-device overhead into a slot in the proc_slots SHM segment (128 slots, each with PID + `[AtomicU64; MAX_DEVICES]`).
 4. **Effective limit** — `effective_mem_limit = mem_limit - total_overhead` (summed across all live processes). The `try_reserve` fast path uses `effective_mem_limit` when non-zero, falling back to `mem_limit` before the first reconciliation.
 
-**All-devices reconciliation:** A single fdinfo scan and DashMap pass updates overhead and effective limits for ALL mapped devices — not just the device being allocated on. This prevents stale effective limits on multi-GPU setups.
+**All-devices reconciliation:** A single KFD sysfs read and DashMap pass updates overhead and effective limits for ALL mapped devices — not just the device being allocated on. This prevents stale effective limits on multi-GPU setups.
 
 ## Process Lifecycle
 
@@ -181,7 +181,7 @@ AMD GPU UUIDs are PCI BDF-based. `normalize_uuid_to_bdf()` unifies naming conven
 | File | Purpose |
 |------|---------|
 | `hipflex.rs` | Entry point, `#[ctor]`, dlsym detour, init orchestration |
-| `limiter.rs` | Limiter struct, SHM accounting, device mapping, DRM reconciliation |
+| `limiter.rs` | Limiter struct, SHM accounting, device mapping, KFD sysfs reconciliation |
 | `config.rs` | PodConfig struct |
 | `detour/mem.rs` | 22 Frida inline hooks on `libamdhip64.so` (15 alloc + 7 free), size computation helpers |
 | `detour/smi.rs` | SMI spoofing via dlsym-level interception (rocm-smi, amd-smi) |
