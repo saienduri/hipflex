@@ -12,6 +12,10 @@ Each hooked HIP function is intercepted at up to three levels:
 
 All three paths converge on the same detour functions — the accounting and enforcement logic is written once. LD_PRELOAD exports and dlsym overrides call the detour directly; Frida inline hooks redirect to the detour via prologue patching. The detour calls the original function through the Frida trampoline, not back through the export symbol, preventing infinite recursion.
 
+A thread-local reentrancy guard prevents double-counting when hooked HIP functions internally call other hooked functions (e.g., `hipMemAllocPitch` → `hipMallocPitch` in CLR). The inner call falls through to native without accounting.
+
+All 27 HIP hooks are declared in a single `hip_hooks!` macro table (`detour/mem.rs`) that generates all three interception mechanisms from one source of truth. Adding or removing a hook is a one-line change.
+
 ## Hook Coverage (31 hooks, 27 LD_PRELOAD exports)
 
 **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate, hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate, hipMallocMipmappedArray, hipMipmappedArrayCreate
