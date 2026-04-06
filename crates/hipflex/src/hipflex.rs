@@ -482,6 +482,24 @@ fn init_hooks() {
     tracing::debug!("Hook initialization completed");
 }
 
+/// Ensure hipflex is fully initialized (logging, limiter, Frida hooks).
+///
+/// Called from LD_PRELOAD symbol exports to trigger lazy init when applications
+/// link directly against libamdhip64.so (PLT resolution bypasses our `dlsym`
+/// override). The `CTOR_COMPLETE` guard prevents running during `.init_array`,
+/// which would corrupt ROCr state.
+pub(crate) fn ensure_init() {
+    if CTOR_COMPLETE.load(Ordering::Acquire) && !INIT_HOOKS_ATTEMPTED.load(Ordering::Acquire) {
+        init_hooks();
+    }
+    // Sequential (not else-if): init_hooks() sets INIT_HOOKS_ATTEMPTED, so the second
+    // branch can fire in the same call — completing full init in one pass rather than
+    // requiring two separate dlsym calls like the dlsym override path.
+    if INIT_HOOKS_ATTEMPTED.load(Ordering::Acquire) && !HOOKS_INITIALIZED.load(Ordering::Acquire) {
+        try_install_hip_hooks();
+    }
+}
+
 thread_local! {
     static IN_DLSYM_DETOUR: Cell<bool> = const { Cell::new(false) };
 }

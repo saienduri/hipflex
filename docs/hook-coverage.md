@@ -2,13 +2,25 @@
 
 All HIP memory allocation APIs that consume physical VRAM are hooked. This document tracks what is hooked, what was evaluated and excluded, and known gaps.
 
-## Hook Coverage (28 hooks)
+## Interception Layers
+
+Each hooked HIP function is intercepted at up to three levels:
+
+1. **LD_PRELOAD exports** (27 `#[no_mangle]` symbols) — intercepts PLT-resolved calls from applications that link directly against `libamdhip64.so` (e.g., PyTorch). Primary path for most frameworks.
+2. **dlsym override** — intercepts `dlsym` lookups and returns detour function pointers. Covers applications that `dlopen`/`dlsym` the HIP library at runtime (e.g., SMI tools).
+3. **Frida GUM inline hooks** — patches function prologues inside `libamdhip64.so`. Catches internal call chains within the HIP runtime.
+
+All three paths converge on the same detour functions — the accounting and enforcement logic is written once. LD_PRELOAD exports and dlsym overrides call the detour directly; Frida inline hooks redirect to the detour via prologue patching. The detour calls the original function through the Frida trampoline, not back through the export symbol, preventing infinite recursion.
+
+## Hook Coverage (31 hooks, 27 LD_PRELOAD exports)
 
 **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync, hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate, hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate, hipMallocMipmappedArray, hipMipmappedArrayCreate
 
 **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy, hipFreeMipmappedArray, hipMipmappedArrayDestroy
 
-**Spoofing (5):** hipMemGetInfo, hipDeviceTotalMem (inline Frida), rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total, amdsmi_get_gpu_vram_info (dlsym-level)
+**Spoofing — inline (5):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties, hipGetDevicePropertiesR0600, hipGetDevicePropertiesR0000 (Frida GUM + LD_PRELOAD export)
+
+**Spoofing — dlsym-level (3):** rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total, amdsmi_get_gpu_vram_info
 
 **System (1):** dlsym (catches late-loaded libraries)
 

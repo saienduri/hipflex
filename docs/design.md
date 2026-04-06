@@ -48,12 +48,40 @@ Reads `FH_SHM_FILE` and `FH_VISIBLE_DEVICES` env vars. SHM is lazily opened on f
 ## Init Flow
 
 1. **Library load** — `#[ctor] entry_point()` runs when `LD_PRELOAD` loads the cdylib. If `FH_ENABLE_HOOKS=false`, returns immediately (full passthrough). Otherwise, installs the `dlsym` hook and returns — no logging, no limiter init, no HIP hook installation. This is critical: logging setup during `.init_array` corrupts HIP/ROCr internal state, breaking rocFFT's JIT kernel compilation.
-2. **Deferred init** — on the first `dlsym` call for a HIP or SMI symbol (after `.init_array` completes), the `dlsym` detour triggers `init_hooks()` which runs the full init sequence.
+2. **Deferred init** — triggered by `ensure_init()`, which fires on every LD_PRELOAD export call and every `dlsym` override. Uses atomic guards (`CTOR_COMPLETE`, `INIT_HOOKS_ATTEMPTED`, `HOOKS_INITIALIZED`) with `compare_exchange` for at-most-once semantics. Safe to call from multiple threads and from both entry paths concurrently.
 3. **Logging** — `logging::init()` sets up the tracing subscriber. Must run after `.init_array` completes.
 4. **Config resolution** — selects operating mode per the priority table above.
 5. **Device mapping** — enumerates GPUs, matches against config UUIDs by PCI BDF normalization.
 6. **SHM attach** — created and injected eagerly in standalone mode, lazily opened in mock mode.
-7. **Hook installation** — creates a Frida GUM `HookManager`, replaces 24 symbols in `libamdhip64.so` via inline hooks (15 alloc + 7 free + 2 info spoofing). The remaining 4 hooks (3 SMI spoofing + 1 `dlsym`) operate at the `dlsym`-interception level. Guarded by `catch_unwind` to prevent panics from crashing the host application. If `libamdhip64.so` is not yet loaded, inline hook installation is skipped; subsequent `dlsym` calls retry until the library appears.
+7. **Hook installation** — creates a Frida GUM `HookManager`, replaces 27 symbols in `libamdhip64.so` via inline hooks (15 alloc + 7 free + 5 info spoofing). The remaining 4 hooks (3 SMI spoofing + 1 `dlsym`) operate at the `dlsym`-interception level. Guarded by `catch_unwind` to prevent panics from crashing the host application. If `libamdhip64.so` is not yet loaded, inline hook installation is skipped; subsequent `dlsym` calls retry until the library appears.
+
+## Interception Paths
+
+There are three independent interception mechanisms, ensuring coverage regardless of how the application resolves HIP symbols:
+
+```
+Application
+  │
+  ├─ PLT (direct link against libamdhip64.so)
+  │    → LD_PRELOAD export (27 #[no_mangle] symbols)
+  │    → ensure_init() → detour fn → Frida trampoline (real fn)
+  │
+  ├─ dlsym(handle, "hipMalloc")
+  │    → dlsym override
+  │    → ensure_init() → returns detour fn pointer
+  │
+  └─ Internal libamdhip64 calls (e.g. hipMallocPitch → hipMalloc)
+       → Frida GUM inline hook (patches function prologue)
+       → detour fn → Frida trampoline (real fn)
+```
+
+**LD_PRELOAD exports** — 27 `#[no_mangle] pub unsafe extern "C"` functions that intercept PLT-resolved calls. This is the primary path for frameworks like PyTorch that link directly against `libamdhip64.so` and never call `dlsym`. Each export calls `ensure_init()`, then forwards to the corresponding detour function. If hooks aren't initialized yet (e.g., called before `.init_array` completes), the export falls through to the real function via `real_dlsym(RTLD_NEXT, ...)`.
+
+**dlsym override** — intercepts `dlsym` calls and returns detour function pointers for HIP/SMI symbols. This is the path for applications that `dlopen`/`dlsym` the HIP library at runtime (e.g., SMI tools). Also triggers `ensure_init()`.
+
+**Frida GUM inline hooks** — patches the prologue of functions inside `libamdhip64.so` to redirect to detour functions. This catches internal call chains within the HIP runtime (e.g., `hipMallocPitch` calling `hipMalloc` internally). The Frida trampoline preserves the original function entry point for calling the real implementation.
+
+All three paths converge on the same detour functions — accounting and enforcement logic is written once. The detour calls the original function through the Frida trampoline (original function entry point), not back through the export symbol, preventing infinite recursion.
 
 ## Reserve-Then-Allocate
 
@@ -75,7 +103,39 @@ The under-utilization window (between reserve and native call) is bounded by one
 
 ## KFD Sysfs Overhead Tracking
 
-Not all GPU VRAM usage goes through HIP allocation APIs. The ROCm runtime stack and kernel driver allocate memory for code objects, scratch buffers, page tables, and HSA state that is invisible to the limiter's hooks. On MI325X with PyTorch workloads, this overhead ranges from 3.5–9 GiB per process.
+Not all GPU VRAM usage goes through HIP allocation APIs. The ROCm runtime stack and kernel driver allocate memory for code objects, scratch buffers, page tables, and HSA state that is invisible to the limiter's hooks. On MI325X with PyTorch workloads, this overhead is typically 1–3 GiB per process, reaching up to ~10 GiB for test suites that compile hundreds of unique GPU kernels (e.g., inductor, dynamo).
+
+### Why This VRAM Is Invisible to HIP Hooks
+
+Compiled GPU kernels (code objects) are loaded into VRAM through an entirely separate path that bypasses all public HIP memory APIs. The full call chain from ROCm source (`refs/rocm-systems/`):
+
+```
+hipModuleLoadData()                                    [clr/hipamd/src/hip_module.cpp]
+  → PlatformState::loadModule()                        [clr/hipamd/src/hip_platform.cpp]
+    → DynCO::loadCodeObject()                          [clr/hipamd/src/hip_code_object.cpp]
+      → Program::setKernels()                          [clr/rocclr/device/rocm/rocprogram.cpp]
+        → hsa_executable_load_agent_code_object()      [rocr-runtime/.../hsa.cpp]
+          → ExecutableImpl::LoadSegmentV1()             [rocr-runtime/.../executable.cpp]
+            → LoaderContext::SegmentAlloc()             [rocr-runtime/.../amd_loader_context.cpp]
+              → Runtime::AllocateMemory()              [HSA internal, NOT hsa_amd_memory_pool_allocate]
+                → KfdDriver::AllocateKfdMemory()       [rocr-runtime/.../amd_kfd_driver.cpp]
+                  → hsaKmtAllocMemory()                [KFD ioctl: AMDKFD_IOC_ALLOC_MEMORY_OF_GPU]
+```
+
+There is no `hipMalloc`, `hipMemCreate`, or any public HIP allocation API anywhere in this chain. The HSA runtime's loader uses its internal `LoaderContext::SegmentAlloc()` which calls the KFD kernel driver directly via `hsaKmtAllocMemory()`. This is architecturally separate from user-facing allocations — even perfect HIP API hooking cannot observe these allocations.
+
+The same KFD ioctl path is used for scratch buffers (wavefront spill memory), page tables, and HSA queue state. All are allocated by the runtime/driver stack, not by application code.
+
+**Measured impact** (MI325X, compiled with `torch.compile`):
+
+| Workload | Unique GPU kernels | non-hipMalloc overhead |
+|----------|-------------------|----------------------|
+| Single model inference (Qwen 7B) | ~20–30 | 1.2–1.3 GiB |
+| PyTorch CI test suite (inductor, dynamo, nn) | Hundreds–thousands | 5–10 GiB |
+
+Each compiled kernel contributes ~1–50 MiB as a code object in VRAM. The overhead scales with kernel diversity, not model size.
+
+**Why hooking `hipModuleLoadData` is not feasible:** The function receives the binary image (ELF bytes), not the VRAM footprint. The actual VRAM consumed depends on segment layout, alignment, and page table overhead determined by the HSA loader. Denying the call would prevent the workload from running entirely. The reconciliation approach — measuring actual VRAM via KFD sysfs and tightening `effective_mem_limit` — handles all overhead sources uniformly without needing to intercept internal loading paths.
 
 **How it works:**
 
@@ -183,7 +243,7 @@ AMD GPU UUIDs are PCI BDF-based. `normalize_uuid_to_bdf()` unifies naming conven
 | `hipflex.rs` | Entry point, `#[ctor]`, dlsym detour, init orchestration |
 | `limiter.rs` | Limiter struct, SHM accounting, device mapping, KFD sysfs reconciliation |
 | `config.rs` | PodConfig struct |
-| `detour/mem.rs` | 22 Frida inline hooks on `libamdhip64.so` (15 alloc + 7 free), size computation helpers |
+| `detour/mem.rs` | 27 Frida inline hooks (15 alloc + 7 free + 5 info spoofing), 27 LD_PRELOAD exports, size computation helpers |
 | `detour/smi.rs` | SMI spoofing via dlsym-level interception (rocm-smi, amd-smi) |
 | `hiplib.rs` | Thin `libloading` wrapper around `libamdhip64.so` for non-hooked HIP queries |
 | `kfd.rs` | KFD sysfs GPU discovery, post-init BDF verification |
