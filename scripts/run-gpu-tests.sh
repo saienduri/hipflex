@@ -131,6 +131,7 @@ if $run_gpu; then
                 --device=/dev/kfd --device=/dev/dri --group-add video \
                 -v "${THEROCK_PATH}:/opt/rocm:ro" \
                 -v /usr/lib/x86_64-linux-gnu:/usr/lib/x86_64-linux-gnu:ro \
+                -v /proc:/host/proc:ro \
                 -v "${SO_PATH}:/workspace/libhipflex.so:ro" \
                 -v "${PROJECT_DIR}/tests/gpu-tests:/workspace/tests/gpu-tests:ro" \
                 hipflex-runner pytest "${pytest_args[@]}"; then

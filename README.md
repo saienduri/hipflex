@@ -63,7 +63,7 @@ Accepts bytes (`137438953472`), SI (`128G`, `512MB`), binary (`128GiB`, `512MiB`
  └──────────────────────────────────────────────────────────────────┘
 ```
 
-Non-HIP memory (code objects, page tables, scratch buffers) is tracked via DRM fdinfo and reconciled into the effective limit. Crashed or killed processes are automatically reaped so stale overhead doesn't reduce capacity. Each GPU gets independent accounting — `FH_MEMORY_LIMIT` applies per device. Structured logging via `tracing` covers VRAM usage, overhead, and slot state with configurable levels and file rotation.
+Non-HIP memory (code objects, page tables, scratch buffers) is tracked via KFD sysfs and reconciled into the effective limit. Crashed or killed processes are automatically reaped so stale overhead doesn't reduce capacity. Each GPU gets independent accounting — `FH_MEMORY_LIMIT` applies per device. Structured logging via `tracing` covers VRAM usage, overhead, and slot state with configurable levels and file rotation.
 
 ## Configuration
 

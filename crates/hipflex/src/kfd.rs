@@ -3,13 +3,10 @@
 //! This avoids initializing GPU context during standalone mode init, which would
 //! break fork safety (child inherits stale GPU state).
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::Path;
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
 
 /// A GPU device discovered via KFD sysfs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +15,8 @@ pub struct GpuDevice {
     pub pci_bdf: String,
     /// DRM render node minor number, e.g. 128 → /dev/dri/renderD128
     pub render_minor: u32,
+    /// KFD gpu_id — used as suffix in `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>`.
+    pub gpu_id: u64,
 }
 
 /// Parsed fields from a KFD topology node's `properties` file.
@@ -54,10 +53,6 @@ impl fmt::Display for EnumerationError {
 
 impl std::error::Error for EnumerationError {}
 
-// ---------------------------------------------------------------------------
-// BDF decoding
-// ---------------------------------------------------------------------------
-
 /// Decode a PCI Bus/Device/Function string from KFD domain and location_id.
 ///
 /// KFD encodes BDF in `location_id` as:
@@ -70,10 +65,6 @@ pub fn decode_pci_bdf(domain: u32, location_id: u32) -> String {
     let function = location_id & 0x7;
     format!("{domain:04x}:{bus:02x}:{device:02x}.{function}")
 }
-
-// ---------------------------------------------------------------------------
-// Properties parsing
-// ---------------------------------------------------------------------------
 
 /// Parse required fields from the content of a KFD node `properties` file.
 ///
@@ -110,10 +101,6 @@ pub fn parse_properties(content: &str) -> Result<NodeProperties, EnumerationErro
             .ok_or_else(|| EnumerationError::MissingField("drm_render_minor".into()))?,
     })
 }
-
-// ---------------------------------------------------------------------------
-// Sysfs enumeration
-// ---------------------------------------------------------------------------
 
 const KFD_TOPOLOGY_PATH: &str = "/sys/class/kfd/kfd/topology/nodes";
 const DRI_PATH: &str = "/dev/dri";
@@ -186,6 +173,7 @@ pub fn enumerate_gpu_devices_from(
         devices.push(GpuDevice {
             pci_bdf,
             render_minor: props.drm_render_minor,
+            gpu_id,
         });
     }
 
@@ -196,9 +184,131 @@ pub fn enumerate_gpu_devices_from(
     Ok(devices)
 }
 
-// ---------------------------------------------------------------------------
-// Post-init verification
-// ---------------------------------------------------------------------------
+const KFD_PROC_PATH: &str = "/sys/class/kfd/kfd/proc";
+
+/// Read per-process VRAM usage from KFD sysfs, returning a map of PCI BDF → bytes.
+///
+/// Reads `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` for each known GPU device.
+/// The `pid` must be a **host PID** (KFD sysfs is not PID-namespace-aware).
+/// Use [`resolve_host_pid`] to translate container PIDs before calling this.
+pub fn read_kfd_vram_for_pid(pid: u32, gpu_devices: &[GpuDevice]) -> HashMap<String, u64> {
+    read_kfd_vram_for_pid_from(Path::new(KFD_PROC_PATH), pid, gpu_devices)
+}
+
+fn read_kfd_vram_for_pid_from(
+    kfd_proc_base: &Path,
+    pid: u32,
+    gpu_devices: &[GpuDevice],
+) -> HashMap<String, u64> {
+    let mut result = HashMap::new();
+    let proc_dir = kfd_proc_base.join(pid.to_string());
+    for device in gpu_devices {
+        let vram_path = proc_dir.join(format!("vram_{}", device.gpu_id));
+        let bytes = match fs::read_to_string(&vram_path) {
+            Ok(content) => match content.trim().parse::<u64>() {
+                Ok(v) => v,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        *result.entry(device.pci_bdf.clone()).or_insert(0) += bytes;
+    }
+    result
+}
+
+const DEFAULT_HOST_PROC: &str = "/host/proc";
+
+/// Resolve the host PID for the current process.
+///
+/// In containers with a separate PID namespace, `getpid()` returns the
+/// container-local PID which doesn't exist in KFD sysfs (which uses host PIDs).
+///
+/// Resolution strategy:
+/// 1. Check if our PID exists in KFD sysfs → we're on bare metal, return as-is.
+/// 2. Scan `host_proc_path` (typically `/host/proc`, mounted via `-v /proc:/host/proc:ro`)
+///    for a process whose `NSpid` line ends with our container PID → return the host PID.
+/// 3. If neither works, return `None` (overhead tracking disabled).
+pub fn resolve_host_pid(gpu_devices: &[GpuDevice]) -> Option<u32> {
+    resolve_host_pid_with(
+        std::process::id(),
+        Path::new(KFD_PROC_PATH),
+        &host_proc_path(),
+        gpu_devices,
+    )
+}
+
+fn host_proc_path() -> std::path::PathBuf {
+    std::env::var("FH_HOST_PROC_PATH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::path::PathBuf::from(DEFAULT_HOST_PROC))
+}
+
+fn resolve_host_pid_with(
+    container_pid: u32,
+    kfd_proc_base: &Path,
+    host_proc_base: &Path,
+    gpu_devices: &[GpuDevice],
+) -> Option<u32> {
+    // Fast path: our PID already works in KFD sysfs (bare metal or --pid=host).
+    if let Some(first_device) = gpu_devices.first() {
+        let probe_path = kfd_proc_base
+            .join(container_pid.to_string())
+            .join(format!("vram_{}", first_device.gpu_id));
+        if probe_path.parent().is_some_and(|d| d.exists()) {
+            return Some(container_pid);
+        }
+    }
+
+    // Container path: scan host procfs for our NSpid.
+    scan_host_proc_for_nspid(host_proc_base, container_pid)
+}
+
+/// Scan `/host/proc/*/status` to find the host PID whose NSpid ends with
+/// our container PID.
+///
+/// The `NSpid` line in `/proc/<pid>/status` lists the PID in each namespace
+/// from outermost to innermost. When reading from the host's procfs mount,
+/// the last value is the container PID.
+fn scan_host_proc_for_nspid(host_proc_base: &Path, container_pid: u32) -> Option<u32> {
+    let entries = match fs::read_dir(host_proc_base) {
+        Ok(e) => e,
+        Err(_) => return None,
+    };
+
+    let target = container_pid.to_string();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Only look at numeric directories (PID entries).
+        if !name_str.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+
+        let status_path = entry.path().join("status");
+        let content = match fs::read_to_string(&status_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+
+        for line in content.lines() {
+            if let Some(rest) = line.strip_prefix("NSpid:") {
+                let pids: Vec<&str> = rest.split_whitespace().collect();
+                // Last value is the innermost (container) PID.
+                // First value is the host PID (from the host procfs perspective).
+                if pids.len() >= 2 && pids.last() == Some(&target.as_str()) {
+                    if let Ok(host_pid) = pids[0].parse::<u32>() {
+                        return Some(host_pid);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
+    None
+}
 
 /// One-time verification: compare sysfs-enumerated BDFs against HIP runtime.
 ///
@@ -253,10 +363,6 @@ pub(crate) fn verify_against_hip(sysfs_bdfs: &[String]) {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -402,6 +508,7 @@ unique_id 9895604649984";
         assert_eq!(devices.len(), 1);
         assert_eq!(devices[0].pci_bdf, "0000:75:00.0");
         assert_eq!(devices[0].render_minor, 128);
+        assert_eq!(devices[0].gpu_id, 12345);
     }
 
     #[test]
@@ -428,8 +535,10 @@ unique_id 9895604649984";
         // Should be sorted by node ID: node 1 first, node 2 second.
         assert_eq!(devices[0].pci_bdf, "0000:75:00.0");
         assert_eq!(devices[0].render_minor, 128);
+        assert_eq!(devices[0].gpu_id, 12345);
         assert_eq!(devices[1].pci_bdf, "0000:f5:00.0");
         assert_eq!(devices[1].render_minor, 129);
+        assert_eq!(devices[1].gpu_id, 67890);
     }
 
     #[test]
@@ -503,5 +612,280 @@ unique_id 9895604649984";
             result,
             Err(EnumerationError::SysfsNotAvailable(_))
         ));
+    }
+
+    // -- KFD per-process VRAM read tests --
+
+    fn create_kfd_vram_file(kfd_proc: &Path, pid: u32, gpu_id: u64, bytes: u64) {
+        let proc_dir = kfd_proc.join(pid.to_string());
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(proc_dir.join(format!("vram_{gpu_id}")), bytes.to_string()).unwrap();
+    }
+
+    #[test]
+    fn test_read_kfd_vram_single_device() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("proc");
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 51110,
+        }];
+        create_kfd_vram_file(&kfd_proc, 1234, 51110, 1_073_741_824);
+
+        let result = read_kfd_vram_for_pid_from(&kfd_proc, 1234, &devices);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result["0000:75:00.0"], 1_073_741_824);
+    }
+
+    #[test]
+    fn test_read_kfd_vram_multiple_devices() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("proc");
+        let devices = vec![
+            GpuDevice {
+                pci_bdf: "0000:05:00.0".into(),
+                render_minor: 128,
+                gpu_id: 51110,
+            },
+            GpuDevice {
+                pci_bdf: "0000:46:00.0".into(),
+                render_minor: 129,
+                gpu_id: 22099,
+            },
+            GpuDevice {
+                pci_bdf: "0000:85:00.0".into(),
+                render_minor: 130,
+                gpu_id: 39621,
+            },
+            GpuDevice {
+                pci_bdf: "0000:c6:00.0".into(),
+                render_minor: 131,
+                gpu_id: 47737,
+            },
+        ];
+        create_kfd_vram_file(&kfd_proc, 100, 51110, 5_000_000_000);
+        create_kfd_vram_file(&kfd_proc, 100, 22099, 0);
+        create_kfd_vram_file(&kfd_proc, 100, 39621, 3_000_000_000);
+        // gpu_id 47737 not written — simulates no VRAM used on that GPU
+
+        let result = read_kfd_vram_for_pid_from(&kfd_proc, 100, &devices);
+        assert_eq!(
+            result.get("0000:05:00.0").copied().unwrap_or(0),
+            5_000_000_000
+        );
+        assert_eq!(result.get("0000:46:00.0").copied().unwrap_or(0), 0);
+        assert_eq!(
+            result.get("0000:85:00.0").copied().unwrap_or(0),
+            3_000_000_000
+        );
+        assert_eq!(result.get("0000:c6:00.0"), None); // file not present
+    }
+
+    #[test]
+    fn test_read_kfd_vram_missing_proc_dir() {
+        let nonexistent = Path::new("/tmp/does-not-exist-kfd-proc-test");
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 51110,
+        }];
+
+        let result = read_kfd_vram_for_pid_from(nonexistent, 9999, &devices);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_read_kfd_vram_empty_device_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("proc");
+        let result = read_kfd_vram_for_pid_from(&kfd_proc, 1234, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_read_kfd_vram_malformed_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("proc");
+        let proc_dir = kfd_proc.join("1234");
+        fs::create_dir_all(&proc_dir).unwrap();
+        fs::write(proc_dir.join("vram_51110"), "not_a_number\n").unwrap();
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 51110,
+        }];
+        let result = read_kfd_vram_for_pid_from(&kfd_proc, 1234, &devices);
+        assert!(result.is_empty());
+    }
+
+    // -- Host PID resolution tests --
+
+    fn create_host_proc_status(host_proc: &Path, host_pid: u32, nspid_line: &str) {
+        let pid_dir = host_proc.join(host_pid.to_string());
+        fs::create_dir_all(&pid_dir).unwrap();
+        fs::write(pid_dir.join("status"), nspid_line).unwrap();
+    }
+
+    #[test]
+    fn test_resolve_host_pid_bare_metal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let host_proc = tmp.path().join("host_proc");
+
+        // Our PID exists in KFD sysfs → bare metal, return as-is.
+        let our_pid = 1234u32;
+        let kfd_pid_dir = kfd_proc.join(our_pid.to_string());
+        fs::create_dir_all(&kfd_pid_dir).unwrap();
+        fs::write(kfd_pid_dir.join("vram_9091"), "0").unwrap();
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 9091,
+        }];
+
+        let result = resolve_host_pid_with(our_pid, &kfd_proc, &host_proc, &devices);
+        assert_eq!(result, Some(1234));
+    }
+
+    #[test]
+    fn test_resolve_host_pid_container_nspid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let host_proc = tmp.path().join("host_proc");
+        fs::create_dir_all(&kfd_proc).unwrap();
+        fs::create_dir_all(&host_proc).unwrap();
+
+        // Container PID 42 maps to host PID 98765.
+        create_host_proc_status(
+            &host_proc,
+            98765,
+            "Name:\tpython3\nPid:\t98765\nNSpid:\t98765\t42\n",
+        );
+        // Another process (not us).
+        create_host_proc_status(
+            &host_proc,
+            11111,
+            "Name:\tbash\nPid:\t11111\nNSpid:\t11111\t1\n",
+        );
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 9091,
+        }];
+
+        let result = resolve_host_pid_with(42, &kfd_proc, &host_proc, &devices);
+        assert_eq!(result, Some(98765));
+    }
+
+    #[test]
+    fn test_resolve_host_pid_no_host_proc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let nonexistent = tmp.path().join("no_such_dir");
+        fs::create_dir_all(&kfd_proc).unwrap();
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 9091,
+        }];
+
+        let result = resolve_host_pid_with(42, &kfd_proc, &nonexistent, &devices);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_host_pid_no_matching_nspid() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let host_proc = tmp.path().join("host_proc");
+        fs::create_dir_all(&kfd_proc).unwrap();
+        fs::create_dir_all(&host_proc).unwrap();
+
+        // No process has container PID 42.
+        create_host_proc_status(
+            &host_proc,
+            11111,
+            "Name:\tbash\nPid:\t11111\nNSpid:\t11111\t99\n",
+        );
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 9091,
+        }];
+
+        let result = resolve_host_pid_with(42, &kfd_proc, &host_proc, &devices);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_host_pid_single_nspid_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let host_proc = tmp.path().join("host_proc");
+        fs::create_dir_all(&kfd_proc).unwrap();
+        fs::create_dir_all(&host_proc).unwrap();
+
+        // Host process (not in a PID namespace) has single NSpid value.
+        create_host_proc_status(&host_proc, 42, "Name:\tpython3\nPid:\t42\nNSpid:\t42\n");
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 9091,
+        }];
+
+        // Single NSpid = no namespace nesting, skip (need len >= 2).
+        let result = resolve_host_pid_with(42, &kfd_proc, &host_proc, &devices);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_resolve_host_pid_nested_namespaces() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let host_proc = tmp.path().join("host_proc");
+        fs::create_dir_all(&host_proc).unwrap();
+
+        // DinD scenario: host → K8s pod → Docker container (3 PID namespaces).
+        // NSpid shows all three: host_pid, pod_pid, container_pid.
+        create_host_proc_status(
+            &host_proc,
+            1287304,
+            "Name:\tpython3\nPid:\t1287304\nNSpid:\t1287304\t5617\t1\n",
+        );
+
+        let devices = vec![GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 9091,
+        }];
+
+        // Container PID is 1 (innermost), should resolve to host PID 1287304.
+        let result = resolve_host_pid_with(1, &kfd_proc, &host_proc, &devices);
+        assert_eq!(result, Some(1287304));
+    }
+
+    #[test]
+    fn test_resolve_host_pid_empty_devices_skips_kfd_check() {
+        let tmp = tempfile::tempdir().unwrap();
+        let kfd_proc = tmp.path().join("kfd_proc");
+        let host_proc = tmp.path().join("host_proc");
+        fs::create_dir_all(&host_proc).unwrap();
+
+        // No KFD devices → skip KFD fast path, go straight to host proc scan.
+        create_host_proc_status(
+            &host_proc,
+            99999,
+            "Name:\tpython3\nPid:\t99999\nNSpid:\t99999\t7\n",
+        );
+
+        let result = resolve_host_pid_with(7, &kfd_proc, &host_proc, &[]);
+        assert_eq!(result, Some(99999));
     }
 }

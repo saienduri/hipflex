@@ -851,28 +851,17 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
 /// byte limit than intended and preventing OOM tests from triggering.
 ///
 /// Strategy: call the real function first (to populate all ~80 fields), then patch only
-/// `totalGlobalMem` with our spoofed limit.
-#[hook_fn]
-pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
-    prop: *mut HipDevicePropPrefix,
-    device_id: c_int,
-) -> HipError {
-    if prop.is_null() {
-        return HIP_ERROR_INVALID_VALUE;
-    }
-    let result = FN_HIP_GET_DEVICE_PROPERTIES(prop, device_id);
-    if result != HIP_SUCCESS {
-        return result;
-    }
-
+/// `totalGlobalMem` with our spoofed limit. Three versioned symbols (bare, R0600, R0000)
+/// share this logic via [`spoof_total_global_mem`].
+unsafe fn spoof_total_global_mem(prop: *mut HipDevicePropPrefix, device_id: c_int) {
     let limiter = match GLOBAL_LIMITER.get() {
         Some(limiter) => limiter,
-        None => return result, // limiter not initialized, return unpatched
+        None => return,
     };
 
     let device_idx = match limiter.device_index_by_hip_device(device_id) {
         Ok(idx) => idx,
-        Err(_) => return result, // unmapped device, return unpatched
+        Err(_) => return,
     };
 
     match limiter.get_pod_memory_usage(device_idx) {
@@ -887,13 +876,26 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
             );
         }
     }
+}
 
+#[hook_fn]
+pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
+    prop: *mut HipDevicePropPrefix,
+    device_id: c_int,
+) -> HipError {
+    if prop.is_null() {
+        return HIP_ERROR_INVALID_VALUE;
+    }
+    let result = FN_HIP_GET_DEVICE_PROPERTIES(prop, device_id);
+    if result == HIP_SUCCESS {
+        spoof_total_global_mem(prop, device_id);
+    }
     result
 }
 
-/// Spoof `hipGetDevicePropertiesR0600` — versioned variant called by PyTorch (compiled against ROCm 6.x).
-/// Same ABI and struct layout as `hipGetDeviceProperties`; needs its own hook because Frida hooks
-/// by address and the versioned symbols resolve to different entry points in libamdhip64.so.
+/// Versioned variant called by PyTorch (compiled against ROCm 6.x). Same ABI and struct layout
+/// as `hipGetDeviceProperties`; needs its own hook because Frida hooks by address and the
+/// versioned symbols resolve to different entry points in libamdhip64.so.
 #[hook_fn]
 pub(crate) unsafe extern "C" fn hip_get_device_properties_r0600_detour(
     prop: *mut HipDevicePropPrefix,
@@ -903,37 +905,13 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_r0600_detour(
         return HIP_ERROR_INVALID_VALUE;
     }
     let result = FN_HIP_GET_DEVICE_PROPERTIES_R0600(prop, device_id);
-    if result != HIP_SUCCESS {
-        return result;
+    if result == HIP_SUCCESS {
+        spoof_total_global_mem(prop, device_id);
     }
-
-    let limiter = match GLOBAL_LIMITER.get() {
-        Some(limiter) => limiter,
-        None => return result,
-    };
-
-    let device_idx = match limiter.device_index_by_hip_device(device_id) {
-        Ok(idx) => idx,
-        Err(_) => return result,
-    };
-
-    match limiter.get_pod_memory_usage(device_idx) {
-        Ok((_used, limit)) => {
-            (*prop).total_global_mem = limit as usize;
-        }
-        Err(e) => {
-            tracing::warn!(
-                device_id,
-                ?e,
-                "hipGetDevicePropertiesR0600: failed to get pod memory usage, returning unpatched"
-            );
-        }
-    }
-
     result
 }
 
-/// Spoof `hipGetDevicePropertiesR0000` — legacy versioned variant.
+/// Legacy versioned variant.
 #[hook_fn]
 pub(crate) unsafe extern "C" fn hip_get_device_properties_r0000_detour(
     prop: *mut HipDevicePropPrefix,
@@ -943,33 +921,9 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_r0000_detour(
         return HIP_ERROR_INVALID_VALUE;
     }
     let result = FN_HIP_GET_DEVICE_PROPERTIES_R0000(prop, device_id);
-    if result != HIP_SUCCESS {
-        return result;
+    if result == HIP_SUCCESS {
+        spoof_total_global_mem(prop, device_id);
     }
-
-    let limiter = match GLOBAL_LIMITER.get() {
-        Some(limiter) => limiter,
-        None => return result,
-    };
-
-    let device_idx = match limiter.device_index_by_hip_device(device_id) {
-        Ok(idx) => idx,
-        Err(_) => return result,
-    };
-
-    match limiter.get_pod_memory_usage(device_idx) {
-        Ok((_used, limit)) => {
-            (*prop).total_global_mem = limit as usize;
-        }
-        Err(e) => {
-            tracing::warn!(
-                device_id,
-                ?e,
-                "hipGetDevicePropertiesR0000: failed to get pod memory usage, returning unpatched"
-            );
-        }
-    }
-
     result
 }
 
@@ -1229,7 +1183,7 @@ pub(crate) unsafe fn enable_hooks(
         FnHip_get_device_properties,
         FN_HIP_GET_DEVICE_PROPERTIES
     ) {
-        tracing::warn!(
+        tracing::debug!(
             "hipGetDeviceProperties bare symbol hook failed: {e:#} — \
              R0600/R0000 hooks will cover all callers"
         );

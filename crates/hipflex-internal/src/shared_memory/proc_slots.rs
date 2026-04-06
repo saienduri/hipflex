@@ -20,7 +20,7 @@ pub struct ProcSlot {
     pub pid: AtomicU32, // 0 = empty slot
     _pad: u32,
     pub used: [AtomicU64; MAX_DEVICES], // per-device hipMalloc memory usage
-    pub non_hip: [AtomicU64; MAX_DEVICES], // per-device non-hipMalloc overhead (from DRM fdinfo)
+    pub non_hip: [AtomicU64; MAX_DEVICES], // per-device non-hipMalloc overhead (from KFD sysfs)
 }
 
 impl ProcSlot {
@@ -153,7 +153,7 @@ impl ProcSlotTable {
     }
 
     /// Write the non-hipMalloc overhead (in bytes) for a device in a slot.
-    /// Called during reconciliation after reading DRM fdinfo.
+    /// Called during reconciliation after reading KFD sysfs VRAM.
     pub fn write_non_hip(&self, slot_idx: usize, device_idx: usize, bytes: u64) {
         if slot_idx < MAX_PROC_SLOTS && device_idx < MAX_DEVICES {
             self.slots[slot_idx].non_hip[device_idx].store(bytes, Ordering::Release);
@@ -345,7 +345,7 @@ impl ProcSlotHandle {
         }
     }
 
-    /// Write non-hipMalloc overhead for a device (from DRM fdinfo reconciliation).
+    /// Write non-hipMalloc overhead for a device (from KFD sysfs reconciliation).
     pub fn write_non_hip(&self, device_idx: usize, bytes: u64) {
         let idx = self.slot_idx.load(Ordering::Acquire);
         if idx != NO_SLOT {

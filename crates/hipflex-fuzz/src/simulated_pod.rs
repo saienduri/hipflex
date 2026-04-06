@@ -8,7 +8,7 @@
 //! - Process lifecycle (spawn, SIGKILL, clean drain)
 //! - Slot exhaustion and reaping
 //!
-//! DRM fdinfo is simulated by injecting `non_hip` values directly — no GPU needed.
+//! KFD sysfs overhead is simulated by injecting `non_hip` values directly — no GPU needed.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -58,7 +58,7 @@ pub struct SimulatedProcess {
     pub slot_idx: Option<usize>,
     alloc_tracker: DashMap<usize, (usize, u64)>, // ptr -> (device_idx, size)
     alloc_count: AtomicU64,
-    /// Per-device non-hipMalloc overhead (injected, simulates DRM fdinfo measurement).
+    /// Per-device non-hipMalloc overhead (injected, simulates KFD sysfs measurement).
     non_hip: Vec<u64>,
     next_pointer: AtomicUsize,
     alive: bool,

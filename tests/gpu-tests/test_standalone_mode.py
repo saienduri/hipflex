@@ -380,8 +380,8 @@ def test_high_overhead_warning():
 
     Strategy: set mem_limit very low (3M ≈ 2.8 MiB) so that the kernel's baseline
     VRAM overhead (~2 MiB for context + page tables) exceeds 25% of the limit.
-    Then do 100 small allocs to trigger reconciliation, which measures DRM
-    resident vs tracked and should log the warning.
+    Then do 100 small allocs to trigger reconciliation, which measures KFD sysfs
+    VRAM resident vs tracked and should log the warning.
     """
     script = """\
         from hip_helper import HIPRuntime
