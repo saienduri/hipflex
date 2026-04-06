@@ -11,7 +11,7 @@ macro_rules! replace_symbol {
                 .hook_export($module, $symbol, $detour as *mut std::ffi::c_void)?
                 .0;
             let original: $fn_type = unsafe { std::mem::transmute(original_ptr) };
-            tracing::trace!(concat!("hooked ", stringify!($symbol)));
+            tracing::trace!("hooked {}", $symbol);
             $storage.set(original).map_err(|_| {
                 $crate::HookError::HookAlreadyInitialized(std::borrow::Cow::Borrowed($symbol))
             })

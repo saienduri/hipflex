@@ -71,6 +71,7 @@ pub fn hook_fn(_attr: TokenStream, item: TokenStream) -> TokenStream {
         #vis type #type_ident = #bare_fn;
 
         #[allow(non_upper_case_globals)]
+        #[cfg_attr(not(test), deny(dead_code))]
         #vis static #static_ident: hipflex_internal::hooks::HookFn<#type_ident> =
             hipflex_internal::hooks::HookFn::default_const();
 
