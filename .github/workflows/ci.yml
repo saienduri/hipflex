@@ -12,7 +12,7 @@ jobs:
     name: Rust fuzzer + unit tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p hipflex -p hipflex-fuzz -p hipflex-internal
@@ -55,7 +55,7 @@ jobs:
           - rocm_version: nightly
             release_type: nightlies
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Set ROCm version
         id: rocm
         run: |
