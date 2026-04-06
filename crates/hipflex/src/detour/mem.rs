@@ -968,285 +968,196 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_r0000_detour(
     result
 }
 
-/// Attaches Frida GUM hooks to all HIP memory allocation, deallocation, and info-spoofing APIs.
+/// Single source of truth for all HIP hooks. Generates three artifacts from one table:
 ///
-/// # Hook coverage (27 hooks registered here; 31 total including smi.rs and dlsym)
+/// 1. `enable_hooks()` — Frida GUM `replace_symbol!` calls for inline hooking
+/// 2. `#[no_mangle]` LD_PRELOAD exports — PLT interception for direct-linked callers
+/// 3. `HOOKED_SYMBOLS` test const — cdylib export verification
 ///
-/// **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync,
-/// hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate,
-/// hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate, hipMallocMipmappedArray,
-/// hipMipmappedArrayCreate
+/// To add a new hook: add one entry here. To remove: delete the entry. No other files change.
 ///
-/// **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy,
-/// hipFreeMipmappedArray, hipMipmappedArrayDestroy
-///
-/// **Spoofing (5 here):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties{,R0600,R0000}
-/// (3 more in smi.rs via dlsym: rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total,
-/// amdsmi_get_gpu_vram_info; plus 1 dlsym hook in hipflex.rs)
-///
-/// # Known gap: graph memory nodes
-///
-/// `hipGraphAddMemAllocNode` and `hipGraphAddMemFreeNode` are NOT hooked. These APIs use an
-/// internal CLR pool allocator (`MemoryPool::AllocateMemory` → `amd::SvmBuffer::malloc()`) that
-/// bypasses all public HIP APIs — neither `hipMalloc` nor `hipFree` is called during graph
-/// execution. Physical VRAM is allocated at `hipGraphLaunch` time, retained in a per-device pool
-/// across graph lifetimes, and only released to the OS via `hipDeviceGraphMemTrim()`.
-///
-/// This gap is accepted because:
-/// 1. Major ML frameworks (PyTorch, JAX, TensorFlow, ONNX Runtime) currently pre-allocate via
-///    private pools or arena allocators before capture. The one edge case is
-///    cuBLAS/hipBLAS 12+ internal workspace calls during stream capture, which frameworks work
-///    around by pre-setting workspace via `cublasSetWorkspace()`.
-/// 2. No production GPU limiter (HAMi-core, tkestack/vcuda, NVIDIA MPS) hooks graph memory.
-/// 3. Synchronous enforcement is impossible — the internal allocator has no public interception
-///    point, and before/after queries on `hipDeviceGetGraphMemAttribute` are racy.
-///
-/// If graph memory becomes relevant, `hipDeviceGetGraphMemAttribute(hipGraphMemAttrReservedMemCurrent)`
-/// can monitor pool usage, and `hipDeviceGraphMemTrim()` can reclaim inactive memory.
-pub(crate) unsafe fn enable_hooks(
-    hook_manager: &mut HookManager,
-) -> Result<(), hipflex_internal::HookError> {
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMalloc",
-        hip_malloc_detour,
-        FnHip_malloc,
-        FN_HIP_MALLOC
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipExtMallocWithFlags",
-        hip_ext_malloc_with_flags_detour,
-        FnHip_ext_malloc_with_flags,
-        FN_HIP_EXT_MALLOC_WITH_FLAGS
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocManaged",
-        hip_malloc_managed_detour,
-        FnHip_malloc_managed,
-        FN_HIP_MALLOC_MANAGED
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocAsync",
-        hip_malloc_async_detour,
-        FnHip_malloc_async,
-        FN_HIP_MALLOC_ASYNC
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocFromPoolAsync",
-        hip_malloc_from_pool_async_detour,
-        FnHip_malloc_from_pool_async,
-        FN_HIP_MALLOC_FROM_POOL_ASYNC
-    )?;
-    // Free hooks must be registered before pitched alloc hooks (hipMallocPitch,
-    // hipMemAllocPitch, hipMalloc3D) because check_and_alloc_pitched! calls FN_HIP_FREE on the
-    // rollback path. Registration order doesn't affect runtime correctness (all
-    // hooks are installed before any are invoked), but keeping this order makes
-    // the dependency explicit for future maintainers.
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipFree",
-        hip_free_detour,
-        FnHip_free,
-        FN_HIP_FREE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipFreeAsync",
-        hip_free_async_detour,
-        FnHip_free_async,
-        FN_HIP_FREE_ASYNC
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMemCreate",
-        hip_mem_create_detour,
-        FnHip_mem_create,
-        FN_HIP_MEM_CREATE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMemRelease",
-        hip_mem_release_detour,
-        FnHip_mem_release,
-        FN_HIP_MEM_RELEASE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocPitch",
-        hip_malloc_pitch_detour,
-        FnHip_malloc_pitch,
-        FN_HIP_MALLOC_PITCH
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMemAllocPitch",
-        hip_mem_alloc_pitch_detour,
-        FnHip_mem_alloc_pitch,
-        FN_HIP_MEM_ALLOC_PITCH
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMalloc3D",
-        hip_malloc_3d_detour,
-        FnHip_malloc_3d,
-        FN_HIP_MALLOC_3D
-    )?;
-    // --- Array free hooks (registered before array alloc hooks for consistency) ---
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipFreeArray",
-        hip_free_array_detour,
-        FnHip_free_array,
-        FN_HIP_FREE_ARRAY
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipArrayDestroy",
-        hip_array_destroy_detour,
-        FnHip_array_destroy,
-        FN_HIP_ARRAY_DESTROY
-    )?;
-    // --- Array alloc hooks ---
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocArray",
-        hip_malloc_array_detour,
-        FnHip_malloc_array,
-        FN_HIP_MALLOC_ARRAY
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMalloc3DArray",
-        hip_malloc_3d_array_detour,
-        FnHip_malloc_3d_array,
-        FN_HIP_MALLOC_3D_ARRAY
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipArrayCreate",
-        hip_array_create_detour,
-        FnHip_array_create,
-        FN_HIP_ARRAY_CREATE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipArray3DCreate",
-        hip_array_3d_create_detour,
-        FnHip_array_3d_create,
-        FN_HIP_ARRAY_3D_CREATE
-    )?;
-    // --- Mipmapped array free hooks (registered before mipmapped alloc hooks for consistency) ---
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipFreeMipmappedArray",
-        hip_free_mipmapped_array_detour,
-        FnHip_free_mipmapped_array,
-        FN_HIP_FREE_MIPMAPPED_ARRAY
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMipmappedArrayDestroy",
-        hip_mipmapped_array_destroy_detour,
-        FnHip_mipmapped_array_destroy,
-        FN_HIP_MIPMAPPED_ARRAY_DESTROY
-    )?;
-    // --- Mipmapped array alloc hooks ---
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMallocMipmappedArray",
-        hip_malloc_mipmapped_array_detour,
-        FnHip_malloc_mipmapped_array,
-        FN_HIP_MALLOC_MIPMAPPED_ARRAY
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMipmappedArrayCreate",
-        hip_mipmapped_array_create_detour,
-        FnHip_mipmapped_array_create,
-        FN_HIP_MIPMAPPED_ARRAY_CREATE
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipMemGetInfo",
-        hip_mem_get_info_detour,
-        FnHip_mem_get_info,
-        FN_HIP_MEM_GET_INFO
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipDeviceTotalMem",
-        hip_device_total_mem_detour,
-        FnHip_device_total_mem,
-        FN_HIP_DEVICE_TOTAL_MEM
-    )?;
-    // hipGetDeviceProperties has three versioned symbols in libamdhip64.so, each at a
-    // different address: hipGetDeviceProperties (default @@hip_4.2),
-    // hipGetDevicePropertiesR0000 (@@hip_4.2), hipGetDevicePropertiesR0600 (@@hip_6.0).
-    // PyTorch compiles against the R0600 variant. All three share the same ABI.
-    //
-    // The bare symbol is a tiny trampoline (single jmp into R0000) that Frida cannot
-    // safely patch — it returns "Bad signature". This is non-fatal: no modern HIP code
-    // calls the bare symbol (hip_runtime_api.h #defines it to R0600). The R0600/R0000
-    // hooks below cover all real callers.
-    if let Err(e) = replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipGetDeviceProperties",
-        hip_get_device_properties_detour,
-        FnHip_get_device_properties,
-        FN_HIP_GET_DEVICE_PROPERTIES
-    ) {
-        tracing::debug!(
-            "hipGetDeviceProperties bare symbol hook failed: {e:#} — \
-             R0600/R0000 hooks will cover all callers"
-        );
-    }
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipGetDevicePropertiesR0600",
-        hip_get_device_properties_r0600_detour,
-        FnHip_get_device_properties_r0600,
-        FN_HIP_GET_DEVICE_PROPERTIES_R0600
-    )?;
-    replace_symbol!(
-        hook_manager,
-        Some("libamdhip64."),
-        "hipGetDevicePropertiesR0000",
-        hip_get_device_properties_r0000_detour,
-        FnHip_get_device_properties_r0000,
-        FN_HIP_GET_DEVICE_PROPERTIES_R0000
-    )?;
+/// `@soft_fail` hooks log and continue on Frida registration failure (vs `?` propagation).
+macro_rules! hip_hooks {
+    (
+        $(
+            $(@ $tag:ident)?
+            $hip_name:ident, $detour:ident, $fn_static:ident, $fn_type:ident,
+            ( $($param:ident : $ty:ty),* $(,)? ) -> $ret:ty
+        );+ $(;)?
+    ) => {
+        // --- Frida GUM hook registration ---
 
-    Ok(())
+        /// Attaches Frida GUM hooks to all HIP memory allocation, deallocation, and
+        /// info-spoofing APIs in `libamdhip64.so`.
+        ///
+        /// # Hook coverage (27 hooks registered here; 31 total including smi.rs and dlsym)
+        ///
+        /// **Alloc (15):** hipMalloc, hipExtMallocWithFlags, hipMallocManaged, hipMallocAsync,
+        /// hipMallocFromPoolAsync, hipMallocPitch, hipMemAllocPitch, hipMalloc3D, hipMemCreate,
+        /// hipMallocArray, hipMalloc3DArray, hipArrayCreate, hipArray3DCreate,
+        /// hipMallocMipmappedArray, hipMipmappedArrayCreate
+        ///
+        /// **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy,
+        /// hipFreeMipmappedArray, hipMipmappedArrayDestroy
+        ///
+        /// **Spoofing (5 here):** hipMemGetInfo, hipDeviceTotalMem,
+        /// hipGetDeviceProperties{,R0600,R0000}
+        /// (3 more in smi.rs via dlsym: rsmi_dev_memory_total_get,
+        /// amdsmi_get_gpu_memory_total, amdsmi_get_gpu_vram_info; plus 1 dlsym hook in
+        /// hipflex.rs)
+        ///
+        /// # Known gap: graph memory nodes
+        ///
+        /// `hipGraphAddMemAllocNode` and `hipGraphAddMemFreeNode` are NOT hooked. These
+        /// APIs use an internal CLR pool allocator that bypasses all public HIP APIs.
+        /// Physical VRAM is allocated at `hipGraphLaunch` time, retained in a per-device
+        /// pool, and only released via `hipDeviceGraphMemTrim()`. This gap is accepted
+        /// because major ML frameworks pre-allocate before capture, no production limiter
+        /// hooks graph memory, and synchronous enforcement is impossible (no public
+        /// interception point).
+        pub(crate) unsafe fn enable_hooks(
+            hook_manager: &mut HookManager,
+        ) -> Result<(), hipflex_internal::HookError> {
+            $(
+                hip_hooks!(@register hook_manager, $(@ $tag,)? $hip_name, $detour, $fn_type, $fn_static);
+            )+
+            Ok(())
+        }
+
+        // --- LD_PRELOAD symbol exports ---
+        //
+        // Applications that link directly against libamdhip64.so (e.g., PyTorch) resolve
+        // HIP functions via PLT at load time, bypassing our `dlsym` override entirely.
+        // Exporting the same symbols from libhipflex.so via LD_PRELOAD makes the dynamic
+        // linker resolve PLT calls to our wrappers first.
+        //
+        // Each export triggers `ensure_init()` (lazy init of logging, limiter, and Frida
+        // hooks), then forwards to the Frida detour. If hooks are not installed (init
+        // failure or pre-.init_array), falls back to the real function via RTLD_NEXT.
+
+        $(
+            #[no_mangle]
+            pub unsafe extern "C" fn $hip_name( $($param : $ty),* ) -> $ret {
+                crate::ensure_init();
+                if $fn_static.get().is_some() {
+                    return $detour( $($param),* );
+                }
+                let ptr = crate::real_dlsym(
+                    libc::RTLD_NEXT,
+                    concat!(stringify!($hip_name), "\0").as_ptr() as *const c_char,
+                );
+                if ptr.is_null() {
+                    return HIP_ERROR_UNKNOWN;
+                }
+                let real: unsafe extern "C" fn( $($ty),* ) -> $ret = std::mem::transmute(ptr);
+                real( $($param),* )
+            }
+        )+
+
+        // --- Test constant ---
+
+        #[cfg(test)]
+        const HOOKED_SYMBOLS: &[&str] = &[
+            $( stringify!($hip_name), )+
+        ];
+    };
+
+    // Normal hook registration — propagates errors with `?`.
+    (@register $mgr:ident, $hip_name:ident, $detour:ident, $fn_type:ident, $fn_static:ident) => {
+        replace_symbol!(
+            $mgr, Some("libamdhip64."),
+            stringify!($hip_name), $detour, $fn_type, $fn_static
+        )?;
+    };
+
+    // Soft-fail hook registration — logs and continues on failure.
+    (@register $mgr:ident, @ soft_fail, $hip_name:ident, $detour:ident, $fn_type:ident, $fn_static:ident) => {
+        if let Err(e) = replace_symbol!(
+            $mgr, Some("libamdhip64."),
+            stringify!($hip_name), $detour, $fn_type, $fn_static
+        ) {
+            tracing::debug!(
+                concat!(stringify!($hip_name), " Frida hook failed (non-fatal): {:#}"),
+                e
+            );
+        }
+    };
+}
+
+// Hook table order: free hooks before pitched alloc hooks because check_and_alloc_pitched!
+// calls FN_HIP_FREE on the rollback path. Registration order doesn't affect runtime
+// correctness (all hooks are installed before any are invoked), but makes the dependency
+// explicit for maintainers.
+//
+// hipGetDeviceProperties bare symbol is @soft_fail because it's a tiny trampoline (single
+// jmp into R0000) that Frida cannot safely patch. Non-fatal: no modern HIP code calls the
+// bare symbol (hip_runtime_api.h #defines it to R0600). The R0600/R0000 hooks cover all
+// real callers. The LD_PRELOAD export still intercepts PLT-resolved calls to the bare name.
+hip_hooks! {
+    // --- Alloc ---
+    hipMalloc, hip_malloc_detour, FN_HIP_MALLOC, FnHip_malloc,
+        (ptr: *mut *mut c_void, size: usize) -> HipError;
+    hipExtMallocWithFlags, hip_ext_malloc_with_flags_detour, FN_HIP_EXT_MALLOC_WITH_FLAGS, FnHip_ext_malloc_with_flags,
+        (ptr: *mut *mut c_void, size_bytes: usize, flags: c_uint) -> HipError;
+    hipMallocManaged, hip_malloc_managed_detour, FN_HIP_MALLOC_MANAGED, FnHip_malloc_managed,
+        (dev_ptr: *mut *mut c_void, size: usize, flags: c_uint) -> HipError;
+    hipMallocAsync, hip_malloc_async_detour, FN_HIP_MALLOC_ASYNC, FnHip_malloc_async,
+        (dev_ptr: *mut *mut c_void, size: usize, stream: HipStream) -> HipError;
+    hipMallocFromPoolAsync, hip_malloc_from_pool_async_detour, FN_HIP_MALLOC_FROM_POOL_ASYNC, FnHip_malloc_from_pool_async,
+        (dev_ptr: *mut *mut c_void, size: usize, mem_pool: HipMemPool, stream: HipStream) -> HipError;
+    hipMemCreate, hip_mem_create_detour, FN_HIP_MEM_CREATE, FnHip_mem_create,
+        (handle: *mut *mut c_void, size: usize, prop: *const c_void, flags: c_ulonglong) -> HipError;
+
+    // --- Free (registered before pitched/array alloc hooks) ---
+    hipFree, hip_free_detour, FN_HIP_FREE, FnHip_free,
+        (ptr: *mut c_void) -> HipError;
+    hipFreeAsync, hip_free_async_detour, FN_HIP_FREE_ASYNC, FnHip_free_async,
+        (ptr: *mut c_void, stream: HipStream) -> HipError;
+    hipMemRelease, hip_mem_release_detour, FN_HIP_MEM_RELEASE, FnHip_mem_release,
+        (handle: *mut c_void) -> HipError;
+    hipFreeArray, hip_free_array_detour, FN_HIP_FREE_ARRAY, FnHip_free_array,
+        (array: *mut c_void) -> HipError;
+    hipArrayDestroy, hip_array_destroy_detour, FN_HIP_ARRAY_DESTROY, FnHip_array_destroy,
+        (array: *mut c_void) -> HipError;
+    hipFreeMipmappedArray, hip_free_mipmapped_array_detour, FN_HIP_FREE_MIPMAPPED_ARRAY, FnHip_free_mipmapped_array,
+        (array: *mut c_void) -> HipError;
+    hipMipmappedArrayDestroy, hip_mipmapped_array_destroy_detour, FN_HIP_MIPMAPPED_ARRAY_DESTROY, FnHip_mipmapped_array_destroy,
+        (array: *mut c_void) -> HipError;
+
+    // --- Pitched/3D alloc (3) ---
+    hipMallocPitch, hip_malloc_pitch_detour, FN_HIP_MALLOC_PITCH, FnHip_malloc_pitch,
+        (ptr: *mut *mut c_void, pitch: *mut usize, width: usize, height: usize) -> HipError;
+    hipMemAllocPitch, hip_mem_alloc_pitch_detour, FN_HIP_MEM_ALLOC_PITCH, FnHip_mem_alloc_pitch,
+        (dptr: *mut *mut c_void, pitch: *mut usize, width_in_bytes: usize, height: usize, element_size_bytes: c_uint) -> HipError;
+    hipMalloc3D, hip_malloc_3d_detour, FN_HIP_MALLOC_3D, FnHip_malloc_3d,
+        (pitched_dev_ptr: *mut HipPitchedPtr, extent: HipExtent) -> HipError;
+
+    // --- Array alloc (6) ---
+    hipMallocArray, hip_malloc_array_detour, FN_HIP_MALLOC_ARRAY, FnHip_malloc_array,
+        (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, width: usize, height: usize, flags: c_uint) -> HipError;
+    hipMalloc3DArray, hip_malloc_3d_array_detour, FN_HIP_MALLOC_3D_ARRAY, FnHip_malloc_3d_array,
+        (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, extent: HipExtent, flags: c_uint) -> HipError;
+    hipArrayCreate, hip_array_create_detour, FN_HIP_ARRAY_CREATE, FnHip_array_create,
+        (array: *mut *mut c_void, desc: *const HipArrayDescriptor) -> HipError;
+    hipArray3DCreate, hip_array_3d_create_detour, FN_HIP_ARRAY_3D_CREATE, FnHip_array_3d_create,
+        (array: *mut *mut c_void, desc: *const HipArray3DDescriptor) -> HipError;
+    hipMallocMipmappedArray, hip_malloc_mipmapped_array_detour, FN_HIP_MALLOC_MIPMAPPED_ARRAY, FnHip_malloc_mipmapped_array,
+        (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, extent: HipExtent, num_levels: c_uint, flags: c_uint) -> HipError;
+    hipMipmappedArrayCreate, hip_mipmapped_array_create_detour, FN_HIP_MIPMAPPED_ARRAY_CREATE, FnHip_mipmapped_array_create,
+        (array: *mut *mut c_void, desc: *mut HipArray3DDescriptor, num_levels: c_uint) -> HipError;
+
+    // --- Info spoofing (5) ---
+    hipMemGetInfo, hip_mem_get_info_detour, FN_HIP_MEM_GET_INFO, FnHip_mem_get_info,
+        (free: *mut usize, total: *mut usize) -> HipError;
+    hipDeviceTotalMem, hip_device_total_mem_detour, FN_HIP_DEVICE_TOTAL_MEM, FnHip_device_total_mem,
+        (bytes: *mut usize, device: HipDevice) -> HipError;
+    @soft_fail
+    hipGetDeviceProperties, hip_get_device_properties_detour, FN_HIP_GET_DEVICE_PROPERTIES, FnHip_get_device_properties,
+        (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError;
+    hipGetDevicePropertiesR0600, hip_get_device_properties_r0600_detour, FN_HIP_GET_DEVICE_PROPERTIES_R0600, FnHip_get_device_properties_r0600,
+        (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError;
+    hipGetDevicePropertiesR0000, hip_get_device_properties_r0000_detour, FN_HIP_GET_DEVICE_PROPERTIES_R0000, FnHip_get_device_properties_r0000,
+        (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError;
 }
 
 #[cfg(test)]
@@ -1601,41 +1512,6 @@ mod tests {
         assert!(entry.is_some(), "guard must clear even after panic unwind");
     }
 
-    // --- LD_PRELOAD export / Frida hook synchronization ---
-
-    /// Every symbol that Frida hooks in `enable_hooks()` must have a corresponding
-    /// `hip_export!` for PLT interception, and vice versa. This list must be updated
-    /// whenever a hook is added or removed.
-    const HOOKED_SYMBOLS: &[&str] = &[
-        "hipMalloc",
-        "hipExtMallocWithFlags",
-        "hipMallocManaged",
-        "hipMallocAsync",
-        "hipMallocFromPoolAsync",
-        "hipMallocPitch",
-        "hipMemAllocPitch",
-        "hipMalloc3D",
-        "hipMemCreate",
-        "hipMallocArray",
-        "hipMalloc3DArray",
-        "hipArrayCreate",
-        "hipArray3DCreate",
-        "hipMallocMipmappedArray",
-        "hipMipmappedArrayCreate",
-        "hipFree",
-        "hipFreeAsync",
-        "hipMemRelease",
-        "hipFreeArray",
-        "hipArrayDestroy",
-        "hipFreeMipmappedArray",
-        "hipMipmappedArrayDestroy",
-        "hipMemGetInfo",
-        "hipDeviceTotalMem",
-        "hipGetDeviceProperties",
-        "hipGetDevicePropertiesR0600",
-        "hipGetDevicePropertiesR0000",
-    ];
-
     #[test]
     fn test_all_exports_present_in_cdylib() {
         // Build the cdylib and verify each hooked symbol is a dynamic export.
@@ -1674,143 +1550,9 @@ mod tests {
                 symbols
                     .lines()
                     .any(|line| line.ends_with(&format!(" T {name}"))),
-                "hip_export! symbol {name} not found as dynamic export in libhipflex.so — \
+                "hip_hooks! symbol {name} not found as dynamic export in libhipflex.so — \
                  missing or misnamed #[no_mangle] export.\nnm output:\n{symbols}"
             );
         }
     }
-
-    #[test]
-    fn test_hooked_symbols_matches_enable_hooks() {
-        let source = include_str!("mem.rs");
-        let start = source
-            .find("pub(crate) unsafe fn enable_hooks(")
-            .expect("enable_hooks not found");
-        let body = &source[start..];
-        let end = body.find("\n}\n").expect("closing brace not found");
-        let body = &body[..end];
-        let replace_count = body.matches("replace_symbol!(").count();
-        assert_eq!(
-            replace_count,
-            HOOKED_SYMBOLS.len(),
-            "HOOKED_SYMBOLS ({}) out of sync with replace_symbol! calls in enable_hooks() ({replace_count})",
-            HOOKED_SYMBOLS.len()
-        );
-    }
-
-    #[test]
-    fn test_hooked_symbols_have_hip_exports() {
-        let source = include_str!("mem.rs");
-        for &name in HOOKED_SYMBOLS {
-            let pattern = format!("hip_export!({name},");
-            assert!(
-                source.contains(&pattern),
-                "HOOKED_SYMBOLS entry {name} has no hip_export! invocation"
-            );
-        }
-    }
 }
-
-// --- LD_PRELOAD symbol exports ---
-//
-// Applications that link directly against libamdhip64.so (e.g., PyTorch) resolve
-// HIP functions via PLT at load time, bypassing our `dlsym` override entirely.
-// Exporting the same symbols from libhipflex.so via LD_PRELOAD makes the dynamic
-// linker resolve PLT calls to our wrappers first.
-//
-// Each export triggers `ensure_init()` (lazy init of logging, limiter, and Frida
-// hooks), then forwards to the Frida detour. If hooks are not installed (init
-// failure or pre-.init_array), falls back to the real function via RTLD_NEXT.
-
-/// Generate a `#[no_mangle]` LD_PRELOAD export that triggers init and forwards
-/// to the Frida detour, with a `real_dlsym(RTLD_NEXT)` fallback.
-macro_rules! hip_export {
-    (
-        $hip_name:ident,
-        $detour:ident,
-        $fn_static:ident,
-        ( $($param:ident : $ty:ty),* $(,)? ) -> $ret:ty
-    ) => {
-        #[no_mangle]
-        pub unsafe extern "C" fn $hip_name( $($param : $ty),* ) -> $ret {
-            crate::ensure_init();
-            if $fn_static.get().is_some() {
-                // No double-dispatch: detour calls FN_* which holds Frida's
-                // call-original trampoline into libamdhip64, not back to this export.
-                return $detour( $($param),* );
-            }
-            // Hooks not installed — resolve and call the real function.
-            let ptr = crate::real_dlsym(
-                libc::RTLD_NEXT,
-                concat!(stringify!($hip_name), "\0").as_ptr() as *const c_char,
-            );
-            if ptr.is_null() {
-                return HIP_ERROR_UNKNOWN;
-            }
-            let real: unsafe extern "C" fn( $($ty),* ) -> $ret = std::mem::transmute(ptr);
-            real( $($param),* )
-        }
-    };
-}
-
-// Allocation hooks
-hip_export!(hipMalloc, hip_malloc_detour, FN_HIP_MALLOC,
-    (ptr: *mut *mut c_void, size: usize) -> HipError);
-hip_export!(hipExtMallocWithFlags, hip_ext_malloc_with_flags_detour, FN_HIP_EXT_MALLOC_WITH_FLAGS,
-    (ptr: *mut *mut c_void, size_bytes: usize, flags: c_uint) -> HipError);
-hip_export!(hipMallocManaged, hip_malloc_managed_detour, FN_HIP_MALLOC_MANAGED,
-    (dev_ptr: *mut *mut c_void, size: usize, flags: c_uint) -> HipError);
-hip_export!(hipMallocAsync, hip_malloc_async_detour, FN_HIP_MALLOC_ASYNC,
-    (dev_ptr: *mut *mut c_void, size: usize, stream: HipStream) -> HipError);
-hip_export!(hipMallocFromPoolAsync, hip_malloc_from_pool_async_detour, FN_HIP_MALLOC_FROM_POOL_ASYNC,
-    (dev_ptr: *mut *mut c_void, size: usize, mem_pool: HipMemPool, stream: HipStream) -> HipError);
-hip_export!(hipMallocPitch, hip_malloc_pitch_detour, FN_HIP_MALLOC_PITCH,
-    (ptr: *mut *mut c_void, pitch: *mut usize, width: usize, height: usize) -> HipError);
-hip_export!(hipMemAllocPitch, hip_mem_alloc_pitch_detour, FN_HIP_MEM_ALLOC_PITCH,
-    (dptr: *mut *mut c_void, pitch: *mut usize, width_in_bytes: usize, height: usize, element_size_bytes: c_uint) -> HipError);
-hip_export!(hipMalloc3D, hip_malloc_3d_detour, FN_HIP_MALLOC_3D,
-    (pitched_dev_ptr: *mut HipPitchedPtr, extent: HipExtent) -> HipError);
-hip_export!(hipMemCreate, hip_mem_create_detour, FN_HIP_MEM_CREATE,
-    (handle: *mut *mut c_void, size: usize, prop: *const c_void, flags: c_ulonglong) -> HipError);
-
-// Array allocation hooks
-hip_export!(hipMallocArray, hip_malloc_array_detour, FN_HIP_MALLOC_ARRAY,
-    (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, width: usize, height: usize, flags: c_uint) -> HipError);
-hip_export!(hipMalloc3DArray, hip_malloc_3d_array_detour, FN_HIP_MALLOC_3D_ARRAY,
-    (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, extent: HipExtent, flags: c_uint) -> HipError);
-hip_export!(hipArrayCreate, hip_array_create_detour, FN_HIP_ARRAY_CREATE,
-    (array: *mut *mut c_void, desc: *const HipArrayDescriptor) -> HipError);
-hip_export!(hipArray3DCreate, hip_array_3d_create_detour, FN_HIP_ARRAY_3D_CREATE,
-    (array: *mut *mut c_void, desc: *const HipArray3DDescriptor) -> HipError);
-hip_export!(hipMallocMipmappedArray, hip_malloc_mipmapped_array_detour, FN_HIP_MALLOC_MIPMAPPED_ARRAY,
-    (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, extent: HipExtent, num_levels: c_uint, flags: c_uint) -> HipError);
-hip_export!(hipMipmappedArrayCreate, hip_mipmapped_array_create_detour, FN_HIP_MIPMAPPED_ARRAY_CREATE,
-    (array: *mut *mut c_void, desc: *mut HipArray3DDescriptor, num_levels: c_uint) -> HipError);
-
-// Free hooks
-hip_export!(hipFree, hip_free_detour, FN_HIP_FREE,
-    (ptr: *mut c_void) -> HipError);
-hip_export!(hipFreeAsync, hip_free_async_detour, FN_HIP_FREE_ASYNC,
-    (ptr: *mut c_void, stream: HipStream) -> HipError);
-hip_export!(hipMemRelease, hip_mem_release_detour, FN_HIP_MEM_RELEASE,
-    (handle: *mut c_void) -> HipError);
-hip_export!(hipFreeArray, hip_free_array_detour, FN_HIP_FREE_ARRAY,
-    (array: *mut c_void) -> HipError);
-hip_export!(hipArrayDestroy, hip_array_destroy_detour, FN_HIP_ARRAY_DESTROY,
-    (array: *mut c_void) -> HipError);
-hip_export!(hipFreeMipmappedArray, hip_free_mipmapped_array_detour, FN_HIP_FREE_MIPMAPPED_ARRAY,
-    (array: *mut c_void) -> HipError);
-hip_export!(hipMipmappedArrayDestroy, hip_mipmapped_array_destroy_detour, FN_HIP_MIPMAPPED_ARRAY_DESTROY,
-    (array: *mut c_void) -> HipError);
-
-// Info spoofing hooks
-hip_export!(hipMemGetInfo, hip_mem_get_info_detour, FN_HIP_MEM_GET_INFO,
-    (free: *mut usize, total: *mut usize) -> HipError);
-hip_export!(hipDeviceTotalMem, hip_device_total_mem_detour, FN_HIP_DEVICE_TOTAL_MEM,
-    (bytes: *mut usize, device: HipDevice) -> HipError);
-hip_export!(hipGetDeviceProperties, hip_get_device_properties_detour, FN_HIP_GET_DEVICE_PROPERTIES,
-    (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError);
-hip_export!(hipGetDevicePropertiesR0600, hip_get_device_properties_r0600_detour, FN_HIP_GET_DEVICE_PROPERTIES_R0600,
-    (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError);
-hip_export!(hipGetDevicePropertiesR0000, hip_get_device_properties_r0000_detour, FN_HIP_GET_DEVICE_PROPERTIES_R0000,
-    (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError);
