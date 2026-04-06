@@ -13,7 +13,7 @@ LD_PRELOAD → libhipflex.so (Frida GUM inline hooks)
         ├─ Reserve-then-allocate (atomic fetch_add on SHM)
         ├─ Call real HIP API in libamdhip64.so
         ├─ Track allocation in DashMap
-        └─ On free: remove from DashMap, saturating_fetch_sub on SHM
+        └─ On free: take from DashMap, call native free, saturating_fetch_sub on SHM
 ```
 
 The limiter is transparent to applications. Frameworks see the configured VRAM limit as the total GPU memory (via spoofed `hipMemGetInfo`/`hipDeviceTotalMem`/SMI queries), and allocations that exceed the limit return `hipErrorOutOfMemory`.
@@ -34,7 +34,7 @@ Enables VRAM enforcement with just `LD_PRELOAD` + `FH_MEMORY_LIMIT` — no daemo
 Init flow:
 1. Parse `FH_MEMORY_LIMIT` via `size_parser::parse_memory_limit()` → bytes
 2. Enumerate all visible GPUs via KFD sysfs (`/sys/class/kfd/kfd/topology/nodes/`), falling back to HIP runtime if sysfs fails
-3. Build `DeviceConfig` per GPU with `mem_limit` from env var, `up_limit: 100`
+3. Build `DeviceConfig` per GPU with `mem_limit` from env var
 4. Create SHM via `SharedMemoryHandle::create(shm_path, &configs)` at `{SHM_PATH}/shm` (default `/dev/shm/hipflex/shm`). If SHM already exists, joins it without reinitializing — preserving runtime state from concurrent processes
 5. Claim a proc slot for per-process overhead tracking
 6. Install Frida GUM hooks on `libamdhip64.so`
@@ -83,6 +83,8 @@ Application
 
 All three paths converge on the same detour functions — accounting and enforcement logic is written once. The detour calls the original function through the Frida trampoline (original function entry point), not back through the export symbol, preventing infinite recursion.
 
+**Reentrancy guard** — a thread-local `IN_DETOUR` flag (RAII `DetourGuard`) prevents double-counting when hooked HIP functions internally call other hooked functions (e.g., `hipMemAllocPitch` → `hipMallocPitch` in CLR). The inner call sees `IN_DETOUR` already set and falls through to the native function without accounting.
+
 ## Reserve-Then-Allocate
 
 Eliminates the TOCTOU race in check-then-allocate:
@@ -99,7 +101,7 @@ The under-utilization window (between reserve and native call) is bounded by one
 
 **Pitched allocations** (hipMallocPitch, hipMemAllocPitch, hipMalloc3D) use a two-phase variant: reserve an estimate (width × height), call native to learn actual pitch, then reserve the extra difference (pitch − width) × height. If the extra pushes over the limit, the initial reservation is rolled back and the native allocation is freed.
 
-**Free path** uses conservative ordering: call native free first, then decrement SHM via `saturating_fetch_sub`. A crash between free and decrement causes over-reporting (safe direction — prevents overcommit, never allows silent over-allocation).
+**Free path** uses take-free-finalize ordering: remove from DashMap first (prevents ABA races from GPU pointer address reuse), call native free, then decrement SHM via `saturating_fetch_sub`. If native free fails, the DashMap entry is re-inserted. A crash between DashMap remove and SHM decrement causes over-reporting (safe direction — prevents overcommit, never allows silent over-allocation).
 
 ## KFD Sysfs Overhead Tracking
 
@@ -139,9 +141,9 @@ Each compiled kernel contributes ~1–50 MiB as a code object in VRAM. The overh
 
 **How it works:**
 
-1. **KFD sysfs measurement** — `read_kfd_vram_for_pid()` reads `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` to get per-process per-GPU physical VRAM from the kernel.
+1. **KFD sysfs measurement** — `read_kfd_vram_for_pid()` reads `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>` (where `gpu_id` is a numeric KFD identifier from topology, e.g., `51110`) to get per-process per-GPU physical VRAM from the kernel.
 2. **Overhead calculation** — For each mapped device: `non_hip_bytes = vram_resident - tracked_hipMalloc`.
-3. **Per-process proc_slots** — Each process writes its per-device overhead into a slot in the proc_slots SHM segment (128 slots, each with PID + `[AtomicU64; MAX_DEVICES]`).
+3. **Per-process proc_slots** — Each process writes its per-device overhead into a slot in the proc_slots SHM segment (128 slots, each with PID + two arrays of `[AtomicU64; MAX_DEVICES]`: `used` for hipMalloc tracking and `non_hip` for KFD sysfs overhead).
 4. **Effective limit** — `effective_mem_limit = mem_limit - total_overhead` (summed across all live processes). The `try_reserve` fast path uses `effective_mem_limit` when non-zero, falling back to `mem_limit` before the first reconciliation.
 
 **All-devices reconciliation:** A single KFD sysfs read and DashMap pass updates overhead and effective limits for ALL mapped devices — not just the device being allocated on. This prevents stale effective limits on multi-GPU setups.
@@ -189,20 +191,17 @@ Saturating subtraction prevents underflow wrapping. Logs a warning if underflow 
 ## Shared Memory Layout
 
 ```
-SharedDeviceStateV2 (35632 bytes total):
-  devices: [DeviceEntryV2; 16]       — per-device state (16 × 144 = 2304 bytes)
-    uuid: [u8; 64]                   — GPU UUID string
-    device_info: SharedDeviceInfoV2 (72 bytes)
-      up_limit: AtomicU32           — utilization percentage
+SharedDeviceState:
+  devices: [DeviceEntry; 16]         — per-device state
+    uuid_buf: [u8; 64]              — GPU UUID string (PCI BDF-based)
+    device_info: SharedDeviceInfo (24 bytes)
       mem_limit: AtomicU64          — VRAM limit in bytes
-      total_cuda_cores: AtomicU32   — compute cores
-      pod_memory_used: AtomicU64    — current usage (read/write)
-      erl_*: 4 × AtomicU64         — reserved for future compute enforcement
+      pod_memory_used: AtomicU64    — current usage (read/write by limiter)
       effective_mem_limit: AtomicU64 — mem_limit minus non-HIP overhead (0 = not yet computed)
-    is_active: AtomicU32             — device active flag
+    active: AtomicU32                — device active flag
   device_count: AtomicU32
   last_heartbeat: AtomicU64
-  padding: [u8; 512]
+  _padding: [u8; 512]
 ```
 
 SHM path: `{SHM_PATH}/shm` (default `/dev/shm/hipflex/shm`). On tmpfs, cleaned up on reboot. In containers, cleaned up on container termination.
@@ -229,7 +228,7 @@ AMD GPU UUIDs are PCI BDF-based. `normalize_uuid_to_bdf()` unifies naming conven
 |----------|----------|
 | **SHM unavailable at runtime** | Hook falls through to the native call (passthrough). Subsequent calls retry. |
 | **SHM unavailable during free** | Pointer removed from tracker but `pod_memory_used` never decremented — permanent accounting leak for that allocation. |
-| **`libamdhip64.so` not loaded** | Hooks deferred until `dlsym` resolves a HIP symbol. If never loaded, the limiter is a silent no-op. |
+| **`libamdhip64.so` not loaded** | Frida inline hooks cannot be installed. LD_PRELOAD exports and `dlsym` overrides fall through to the real function via `RTLD_NEXT`. The limiter is a silent no-op. |
 | **Hook installation panic** | Caught by `catch_unwind`. Application continues without enforcement. |
 | **Crash between free and decrement** | Over-reports memory (safe direction). Requires restart to reset. |
 | **Invalid `FH_MEMORY_LIMIT`** | Limiter not initialized, all hooks passthrough. |
