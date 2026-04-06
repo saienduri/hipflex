@@ -20,7 +20,7 @@
 
 # ── Stage 1: Build hipflex ──
 
-FROM ubuntu:22.04 AS builder
+FROM ubuntu:24.04 AS builder
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -45,7 +45,7 @@ RUN cargo build --release -p hipflex
 
 # ── Stage 2: Runtime ──
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
