@@ -14,7 +14,7 @@
 #     -v $PWD/tests/gpu-tests:/workspace/tests/gpu-tests:ro \
 #     hipflex-runner pytest -v tests/gpu-tests/
 
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
