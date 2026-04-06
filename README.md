@@ -31,18 +31,23 @@ Accepts bytes (`137438953472`), SI (`128G`, `512MB`), binary (`128GiB`, `512MiB`
  │   hipMalloc(&ptr, size)    hipMemGetInfo()    rocm-smi query    │
  └──────────┬──────────────────────┬──────────────────┬────────────┘
             │                      │                  │
-            │ LD_PRELOAD           │ LD_PRELOAD       │ dlsym override
+            │ PLT / dlsym          │ PLT / dlsym      │ dlsym
             ▼                      ▼                  ▼
  ┌──────────────────────────────────────────────────────────────────┐
  │ libhipflex.so                                                   │
  │                                                                 │
+ │  Three interception paths:                                      │
+ │  1. LD_PRELOAD exports (27 symbols) — PLT callers (PyTorch)    │
+ │  2. dlsym override — dlopen/dlsym callers (SMI tools)          │
+ │  3. Frida GUM inline hooks — internal libamdhip64 calls        │
+ │                                                                 │
  │  ┌─────────────────┐  ┌──────────────┐  ┌────────────────────┐ │
  │  │ Alloc/Free Hooks │  │ Info Spoofing │  │ SMI Spoofing      │ │
  │  │ 15 alloc + 7 free│  │ hipMemGetInfo │  │ rocm-smi, amd-smi │ │
- │  │ (Frida GUM)      │  │ hipDevTotal   │  │ (dlsym override)  │ │
+ │  │                  │  │ hipDevTotal   │  │ (dlsym override)  │ │
  │  └────────┬─────────┘  │ hipGetDevProp │  └────────────────────┘ │
- │           │             │ (Frida GUM)  │                        │
- │           ▼             └──────────────┘                         │
+ │           │             └──────────────┘                         │
+ │           ▼                                                      │
  │  ┌────────────────────────────────────────────┐                 │
  │  │ Limiter (reserve-then-allocate)            │                 │
  │  │                                            │                 │

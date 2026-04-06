@@ -1,4 +1,5 @@
-use std::ffi::{c_int, c_uint, c_ulonglong, c_void};
+use std::cell::Cell;
+use std::ffi::{c_char, c_int, c_uint, c_ulonglong, c_void};
 
 use hipflex_internal::hooks::HookManager;
 use hipflex_internal::replace_symbol;
@@ -11,6 +12,35 @@ use crate::hiplib::{
 use crate::limiter::Error;
 use crate::with_device;
 use crate::GLOBAL_LIMITER;
+
+thread_local! {
+    static IN_DETOUR: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Reentrancy guard for detour functions. If a hooked HIP function internally calls
+/// another hooked HIP function (e.g., hipMemAllocPitch → hipMallocPitch in CLR), the
+/// inner call must fall through to native to avoid double-counting allocations.
+///
+/// Returns `None` if already inside a detour (caller should fall through to native).
+/// Returns `Some(DetourGuard)` otherwise — the guard clears the flag on drop.
+fn enter_detour() -> Option<DetourGuard> {
+    IN_DETOUR.with(|flag| {
+        if flag.get() {
+            None
+        } else {
+            flag.set(true);
+            Some(DetourGuard)
+        }
+    })
+}
+
+struct DetourGuard;
+
+impl Drop for DetourGuard {
+    fn drop(&mut self) {
+        IN_DETOUR.with(|flag| flag.set(false));
+    }
+}
 
 /// hipPitchedPtr — FFI struct populated by hipMalloc3D.
 #[repr(C)]
@@ -108,6 +138,9 @@ fn handle_reserve_error(error: Error, alloc_name: &str) -> HipError {
 /// $alloc_fn: closure that calls the native allocation function
 macro_rules! check_and_alloc {
     ($out_ptr:expr, $request_size:expr, $alloc_name:expr, $alloc_fn:expr) => {{
+        let Some(_guard) = enter_detour() else {
+            return $alloc_fn();
+        };
         match with_device!() {
             Ok((limiter, device_idx)) => {
                 // One-time deferred verification: compare sysfs BDFs vs HIP.
@@ -159,6 +192,9 @@ macro_rules! check_and_alloc {
 /// $free_fn: expression that calls the native free function, returning HipError
 macro_rules! check_and_free {
     ($ptr:expr, $free_fn:expr) => {{
+        let Some(_guard) = enter_detour() else {
+            return $free_fn;
+        };
         let tracked = if !$ptr.is_null() {
             GLOBAL_LIMITER
                 .get()
@@ -206,6 +242,9 @@ macro_rules! check_and_free {
 /// `$out_pitch_expr`: expression yielding the actual pitch (e.g., `*pitch` or `(*pitched).pitch`)
 macro_rules! check_and_alloc_pitched {
     ($alloc_name:expr, $estimated_size:expr, $native_call:expr, $out_ptr_expr:expr, $out_pitch_expr:expr, $actual_size_fn:expr) => {{
+        let Some(_guard) = enter_detour() else {
+            return $native_call;
+        };
         match with_device!() {
             Ok((limiter, device_idx)) => match limiter.try_reserve(device_idx, $estimated_size) {
                 Ok(_previous_used) => 'alloc: {
@@ -778,8 +817,10 @@ pub(crate) unsafe extern "C" fn hip_mipmapped_array_destroy_detour(
 /// Layout from hip_runtime_api.h (ROCm 6.x):
 ///   char name[256]; hipUUID uuid; char luid[8]; unsigned int luidDeviceNodeMask;
 ///   size_t totalGlobalMem; ...
+///
+/// `pub(crate)` because `hip_export!` generated functions reference this type.
 #[repr(C)]
-struct HipDevicePropPrefix {
+pub(crate) struct HipDevicePropPrefix {
     name: [u8; 256],
     uuid: [u8; 16], // hipUUID
     luid: [u8; 8],
@@ -1535,4 +1576,241 @@ mod tests {
         let half = (u64::MAX / 2) as usize;
         assert_eq!(checked_pitched_size(&[half]), Some(half as u64));
     }
+
+    // --- Reentrancy guard ---
+
+    #[test]
+    fn test_reentrancy_guard_blocks_nested_entry() {
+        let outer = enter_detour();
+        assert!(outer.is_some(), "first entry should succeed");
+        let inner = enter_detour();
+        assert!(inner.is_none(), "nested entry should be blocked");
+        drop(outer);
+        let after = enter_detour();
+        assert!(after.is_some(), "entry should succeed after guard dropped");
+    }
+
+    #[test]
+    fn test_reentrancy_guard_clears_on_panic() {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = enter_detour();
+            panic!("simulated detour panic");
+        }));
+        assert!(result.is_err());
+        let entry = enter_detour();
+        assert!(entry.is_some(), "guard must clear even after panic unwind");
+    }
+
+    // --- LD_PRELOAD export / Frida hook synchronization ---
+
+    /// Every symbol that Frida hooks in `enable_hooks()` must have a corresponding
+    /// `hip_export!` for PLT interception, and vice versa. This list must be updated
+    /// whenever a hook is added or removed.
+    const HOOKED_SYMBOLS: &[&str] = &[
+        "hipMalloc",
+        "hipExtMallocWithFlags",
+        "hipMallocManaged",
+        "hipMallocAsync",
+        "hipMallocFromPoolAsync",
+        "hipMallocPitch",
+        "hipMemAllocPitch",
+        "hipMalloc3D",
+        "hipMemCreate",
+        "hipMallocArray",
+        "hipMalloc3DArray",
+        "hipArrayCreate",
+        "hipArray3DCreate",
+        "hipMallocMipmappedArray",
+        "hipMipmappedArrayCreate",
+        "hipFree",
+        "hipFreeAsync",
+        "hipMemRelease",
+        "hipFreeArray",
+        "hipArrayDestroy",
+        "hipFreeMipmappedArray",
+        "hipMipmappedArrayDestroy",
+        "hipMemGetInfo",
+        "hipDeviceTotalMem",
+        "hipGetDeviceProperties",
+        "hipGetDevicePropertiesR0600",
+        "hipGetDevicePropertiesR0000",
+    ];
+
+    #[test]
+    fn test_all_exports_present_in_cdylib() {
+        // Build the cdylib and verify each hooked symbol is a dynamic export.
+        // Catches typos in hip_export! names and missing #[no_mangle] exports.
+        let output = std::process::Command::new("cargo")
+            .args(["build", "-p", "hipflex", "--lib"])
+            .output()
+            .expect("failed to run cargo build");
+        assert!(
+            output.status.success(),
+            "cargo build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let target_dir = std::env::var("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target")
+            });
+        let so_path = target_dir.join("debug/libhipflex.so");
+        assert!(
+            so_path.exists(),
+            "libhipflex.so not found at {}",
+            so_path.display()
+        );
+
+        let nm_output = std::process::Command::new("nm")
+            .args(["-D", "--defined-only"])
+            .arg(&so_path)
+            .output()
+            .expect("failed to run nm");
+        let symbols = String::from_utf8_lossy(&nm_output.stdout);
+
+        for &name in HOOKED_SYMBOLS {
+            assert!(
+                symbols
+                    .lines()
+                    .any(|line| line.ends_with(&format!(" T {name}"))),
+                "hip_export! symbol {name} not found as dynamic export in libhipflex.so — \
+                 missing or misnamed #[no_mangle] export.\nnm output:\n{symbols}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_hooked_symbols_matches_enable_hooks() {
+        let source = include_str!("mem.rs");
+        let start = source
+            .find("pub(crate) unsafe fn enable_hooks(")
+            .expect("enable_hooks not found");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("closing brace not found");
+        let body = &body[..end];
+        let replace_count = body.matches("replace_symbol!(").count();
+        assert_eq!(
+            replace_count,
+            HOOKED_SYMBOLS.len(),
+            "HOOKED_SYMBOLS ({}) out of sync with replace_symbol! calls in enable_hooks() ({replace_count})",
+            HOOKED_SYMBOLS.len()
+        );
+    }
+
+    #[test]
+    fn test_hooked_symbols_have_hip_exports() {
+        let source = include_str!("mem.rs");
+        for &name in HOOKED_SYMBOLS {
+            let pattern = format!("hip_export!({name},");
+            assert!(
+                source.contains(&pattern),
+                "HOOKED_SYMBOLS entry {name} has no hip_export! invocation"
+            );
+        }
+    }
 }
+
+// --- LD_PRELOAD symbol exports ---
+//
+// Applications that link directly against libamdhip64.so (e.g., PyTorch) resolve
+// HIP functions via PLT at load time, bypassing our `dlsym` override entirely.
+// Exporting the same symbols from libhipflex.so via LD_PRELOAD makes the dynamic
+// linker resolve PLT calls to our wrappers first.
+//
+// Each export triggers `ensure_init()` (lazy init of logging, limiter, and Frida
+// hooks), then forwards to the Frida detour. If hooks are not installed (init
+// failure or pre-.init_array), falls back to the real function via RTLD_NEXT.
+
+/// Generate a `#[no_mangle]` LD_PRELOAD export that triggers init and forwards
+/// to the Frida detour, with a `real_dlsym(RTLD_NEXT)` fallback.
+macro_rules! hip_export {
+    (
+        $hip_name:ident,
+        $detour:ident,
+        $fn_static:ident,
+        ( $($param:ident : $ty:ty),* $(,)? ) -> $ret:ty
+    ) => {
+        #[no_mangle]
+        pub unsafe extern "C" fn $hip_name( $($param : $ty),* ) -> $ret {
+            crate::ensure_init();
+            if $fn_static.get().is_some() {
+                // No double-dispatch: detour calls FN_* which holds Frida's
+                // call-original trampoline into libamdhip64, not back to this export.
+                return $detour( $($param),* );
+            }
+            // Hooks not installed — resolve and call the real function.
+            let ptr = crate::real_dlsym(
+                libc::RTLD_NEXT,
+                concat!(stringify!($hip_name), "\0").as_ptr() as *const c_char,
+            );
+            if ptr.is_null() {
+                return HIP_ERROR_UNKNOWN;
+            }
+            let real: unsafe extern "C" fn( $($ty),* ) -> $ret = std::mem::transmute(ptr);
+            real( $($param),* )
+        }
+    };
+}
+
+// Allocation hooks
+hip_export!(hipMalloc, hip_malloc_detour, FN_HIP_MALLOC,
+    (ptr: *mut *mut c_void, size: usize) -> HipError);
+hip_export!(hipExtMallocWithFlags, hip_ext_malloc_with_flags_detour, FN_HIP_EXT_MALLOC_WITH_FLAGS,
+    (ptr: *mut *mut c_void, size_bytes: usize, flags: c_uint) -> HipError);
+hip_export!(hipMallocManaged, hip_malloc_managed_detour, FN_HIP_MALLOC_MANAGED,
+    (dev_ptr: *mut *mut c_void, size: usize, flags: c_uint) -> HipError);
+hip_export!(hipMallocAsync, hip_malloc_async_detour, FN_HIP_MALLOC_ASYNC,
+    (dev_ptr: *mut *mut c_void, size: usize, stream: HipStream) -> HipError);
+hip_export!(hipMallocFromPoolAsync, hip_malloc_from_pool_async_detour, FN_HIP_MALLOC_FROM_POOL_ASYNC,
+    (dev_ptr: *mut *mut c_void, size: usize, mem_pool: HipMemPool, stream: HipStream) -> HipError);
+hip_export!(hipMallocPitch, hip_malloc_pitch_detour, FN_HIP_MALLOC_PITCH,
+    (ptr: *mut *mut c_void, pitch: *mut usize, width: usize, height: usize) -> HipError);
+hip_export!(hipMemAllocPitch, hip_mem_alloc_pitch_detour, FN_HIP_MEM_ALLOC_PITCH,
+    (dptr: *mut *mut c_void, pitch: *mut usize, width_in_bytes: usize, height: usize, element_size_bytes: c_uint) -> HipError);
+hip_export!(hipMalloc3D, hip_malloc_3d_detour, FN_HIP_MALLOC_3D,
+    (pitched_dev_ptr: *mut HipPitchedPtr, extent: HipExtent) -> HipError);
+hip_export!(hipMemCreate, hip_mem_create_detour, FN_HIP_MEM_CREATE,
+    (handle: *mut *mut c_void, size: usize, prop: *const c_void, flags: c_ulonglong) -> HipError);
+
+// Array allocation hooks
+hip_export!(hipMallocArray, hip_malloc_array_detour, FN_HIP_MALLOC_ARRAY,
+    (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, width: usize, height: usize, flags: c_uint) -> HipError);
+hip_export!(hipMalloc3DArray, hip_malloc_3d_array_detour, FN_HIP_MALLOC_3D_ARRAY,
+    (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, extent: HipExtent, flags: c_uint) -> HipError);
+hip_export!(hipArrayCreate, hip_array_create_detour, FN_HIP_ARRAY_CREATE,
+    (array: *mut *mut c_void, desc: *const HipArrayDescriptor) -> HipError);
+hip_export!(hipArray3DCreate, hip_array_3d_create_detour, FN_HIP_ARRAY_3D_CREATE,
+    (array: *mut *mut c_void, desc: *const HipArray3DDescriptor) -> HipError);
+hip_export!(hipMallocMipmappedArray, hip_malloc_mipmapped_array_detour, FN_HIP_MALLOC_MIPMAPPED_ARRAY,
+    (array: *mut *mut c_void, desc: *const HipChannelFormatDesc, extent: HipExtent, num_levels: c_uint, flags: c_uint) -> HipError);
+hip_export!(hipMipmappedArrayCreate, hip_mipmapped_array_create_detour, FN_HIP_MIPMAPPED_ARRAY_CREATE,
+    (array: *mut *mut c_void, desc: *mut HipArray3DDescriptor, num_levels: c_uint) -> HipError);
+
+// Free hooks
+hip_export!(hipFree, hip_free_detour, FN_HIP_FREE,
+    (ptr: *mut c_void) -> HipError);
+hip_export!(hipFreeAsync, hip_free_async_detour, FN_HIP_FREE_ASYNC,
+    (ptr: *mut c_void, stream: HipStream) -> HipError);
+hip_export!(hipMemRelease, hip_mem_release_detour, FN_HIP_MEM_RELEASE,
+    (handle: *mut c_void) -> HipError);
+hip_export!(hipFreeArray, hip_free_array_detour, FN_HIP_FREE_ARRAY,
+    (array: *mut c_void) -> HipError);
+hip_export!(hipArrayDestroy, hip_array_destroy_detour, FN_HIP_ARRAY_DESTROY,
+    (array: *mut c_void) -> HipError);
+hip_export!(hipFreeMipmappedArray, hip_free_mipmapped_array_detour, FN_HIP_FREE_MIPMAPPED_ARRAY,
+    (array: *mut c_void) -> HipError);
+hip_export!(hipMipmappedArrayDestroy, hip_mipmapped_array_destroy_detour, FN_HIP_MIPMAPPED_ARRAY_DESTROY,
+    (array: *mut c_void) -> HipError);
+
+// Info spoofing hooks
+hip_export!(hipMemGetInfo, hip_mem_get_info_detour, FN_HIP_MEM_GET_INFO,
+    (free: *mut usize, total: *mut usize) -> HipError);
+hip_export!(hipDeviceTotalMem, hip_device_total_mem_detour, FN_HIP_DEVICE_TOTAL_MEM,
+    (bytes: *mut usize, device: HipDevice) -> HipError);
+hip_export!(hipGetDeviceProperties, hip_get_device_properties_detour, FN_HIP_GET_DEVICE_PROPERTIES,
+    (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError);
+hip_export!(hipGetDevicePropertiesR0600, hip_get_device_properties_r0600_detour, FN_HIP_GET_DEVICE_PROPERTIES_R0600,
+    (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError);
+hip_export!(hipGetDevicePropertiesR0000, hip_get_device_properties_r0000_detour, FN_HIP_GET_DEVICE_PROPERTIES_R0000,
+    (prop: *mut HipDevicePropPrefix, device_id: c_int) -> HipError);
