@@ -4,7 +4,15 @@ Flexible GPU fractionalization — run more workloads per GPU. Transparently int
 
 ## Quick start
 
-### Build
+### Install
+
+**Download a release** (no build required):
+
+```bash
+wget -q https://github.com/saienduri/hipflex/releases/download/v0.1.0/libhipflex.so
+```
+
+**Or build from source:**
 
 ```bash
 cargo build --release -p hipflex
@@ -15,13 +23,15 @@ cargo build --release -p hipflex
 
 ```bash
 # Limit each GPU to 4 GiB
-FH_MEMORY_LIMIT=4GiB LD_PRELOAD=./target/release/libhipflex.so python3 train.py
+FH_MEMORY_LIMIT=4GiB LD_PRELOAD=./libhipflex.so python3 train.py
 
 # Limit to 75% of a 64 GiB GPU
-FH_MEMORY_LIMIT=48GiB LD_PRELOAD=./target/release/libhipflex.so python3 train.py
+FH_MEMORY_LIMIT=48GiB LD_PRELOAD=./libhipflex.so python3 train.py
 ```
 
 Accepts bytes (`137438953472`), SI (`128G`, `512MB`), binary (`128GiB`, `512MiB`), or fractional (`1.5G`).
+
+See the [demo guide](docs/demo.md) for full working examples with PyTorch, vLLM, and SGLang on MI325X.
 
 ## Architecture
 
@@ -125,6 +135,7 @@ See [`scripts/run-gpu-tests.sh`](scripts/run-gpu-tests.sh) for setup instruction
 
 ## Documentation
 
+- [Demo](docs/demo.md) — working examples with PyTorch, vLLM, and SGLang, plus accounting validation
 - [Design](docs/design.md) — architecture, operating modes, atomics, SHM layout, failure modes
 - [Hook coverage](docs/hook-coverage.md) — full inventory of hooked HIP/SMI APIs, exclusions, and known gaps
 
