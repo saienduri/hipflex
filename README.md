@@ -1,6 +1,6 @@
 # hipflex
 
-Flexible GPU fractionalization — run more workloads per GPU. Transparently intercepts HIP memory allocation APIs and enforces per-process VRAM limits using shared memory counters — no kernel driver modifications, no daemon, no config files.
+Flexible GPU fractionalization — run more workloads per GPU. Transparently intercepts HIP APIs to enforce per-process VRAM limits and compute (CU) restrictions — no kernel driver modifications, no daemon, no config files.
 
 ## Quick start
 
@@ -25,8 +25,8 @@ cargo build --release -p hipflex
 # Limit each GPU to 4 GiB
 FH_MEMORY_LIMIT=4GiB LD_PRELOAD=./libhipflex.so python3 train.py
 
-# Limit to 75% of a 64 GiB GPU
-FH_MEMORY_LIMIT=48GiB LD_PRELOAD=./libhipflex.so python3 train.py
+# Limit memory AND restrict to 38 of 304 CUs on MI325X
+FH_MEMORY_LIMIT=24GiB FH_CU_RANGE=0-37 LD_PRELOAD=./libhipflex.so python3 train.py
 ```
 
 Accepts bytes (`137438953472`), SI (`128G`, `512MB`), binary (`128GiB`, `512MiB`), or fractional (`1.5G`).
@@ -78,7 +78,7 @@ See the [demo guide](docs/demo.md) for full working examples with PyTorch, vLLM,
  └──────────────────────────────────────────────────────────────────┘
 ```
 
-Non-HIP memory (code objects, page tables, scratch buffers) is tracked via KFD sysfs and reconciled into the effective limit. Crashed or killed processes are automatically reaped so stale overhead doesn't reduce capacity. Each GPU gets independent accounting — `FH_MEMORY_LIMIT` applies per device. Structured logging via `tracing` covers VRAM usage, overhead, and slot state with configurable levels and file rotation.
+Non-HIP memory (code objects, page tables, scratch buffers) is tracked via KFD sysfs and reconciled into the effective limit. Crashed or killed processes are automatically reaped so stale overhead doesn't reduce capacity. Each GPU gets independent accounting — `FH_MEMORY_LIMIT` applies per device. Optional compute restriction via `FH_CU_RANGE` sets `HSA_CU_MASK` before the HIP runtime starts, hardware-limiting which Compute Units a process can use. Structured logging via `tracing` covers VRAM usage, overhead, and slot state with configurable levels and file rotation.
 
 ## Configuration
 
@@ -89,6 +89,7 @@ All configuration is via environment variables.
 | Variable | Description |
 |----------|-------------|
 | `FH_MEMORY_LIMIT` | Per-GPU memory limit. Accepts bytes, SI, binary, or fractional sizes. |
+| `FH_CU_RANGE` | Restrict GPU Compute Units. Format: `start-end` (inclusive, e.g., `0-37` for 38 CUs). Sets `HSA_CU_MASK` and spoofs `multiProcessorCount`. Requires `FH_MEMORY_LIMIT` (standalone mode). |
 | `FH_ENABLE_HOOKS` | Set to `false` to disable all hooking (library becomes a no-op). Default: `true`. |
 | `FH_HIP_LIB_PATH` | Override path to `libamdhip64.so`. |
 | `FH_SHM_PATH` | Override shared memory directory. Default: `/dev/shm/hipflex`. |

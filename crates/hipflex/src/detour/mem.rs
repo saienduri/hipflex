@@ -819,14 +819,31 @@ pub(crate) unsafe extern "C" fn hip_mipmapped_array_destroy_detour(
 ///   size_t totalGlobalMem; ...
 ///
 /// `pub(crate)` because `hip_export!` generated functions reference this type.
+/// Prefix of `hipDeviceProp_t` covering fields we need to spoof.
+/// Layout verified against `hip_runtime_api.h` (ROCm 7.11, lines 111-143).
 #[repr(C)]
 pub(crate) struct HipDevicePropPrefix {
-    name: [u8; 256],
-    uuid: [u8; 16], // hipUUID
-    luid: [u8; 8],
-    luid_device_node_mask: u32,
-    // 4 bytes implicit padding (repr(C) aligns total_global_mem to 8 bytes)
-    total_global_mem: usize, // offset 288
+    name: [u8; 256],            // offset 0
+    uuid: [u8; 16],             // offset 256 (hipUUID)
+    luid: [u8; 8],              // offset 272
+    luid_device_node_mask: u32, // offset 280
+    // 4 bytes implicit padding (repr(C) aligns total_global_mem to 8)
+    total_global_mem: usize,        // offset 288
+    shared_mem_per_block: usize,    // offset 296
+    regs_per_block: c_int,          // offset 304
+    warp_size: c_int,               // offset 308
+    mem_pitch: usize,               // offset 312
+    max_threads_per_block: c_int,   // offset 320
+    max_threads_dim: [c_int; 3],    // offset 324
+    max_grid_size: [c_int; 3],      // offset 336
+    clock_rate: c_int,              // offset 348
+    total_const_mem: usize,         // offset 352
+    major: c_int,                   // offset 360
+    minor: c_int,                   // offset 364
+    texture_alignment: usize,       // offset 368
+    texture_pitch_alignment: usize, // offset 376
+    device_overlap: c_int,          // offset 384
+    multi_processor_count: c_int,   // offset 388
 }
 
 #[hook_fn]
@@ -884,17 +901,18 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
     }
 }
 
-/// Spoof `hipGetDeviceProperties` to report our memory limit as `totalGlobalMem`.
+/// Spoof `hipGetDeviceProperties` to report our memory limit as `totalGlobalMem`,
+/// and our CU range as `multiProcessorCount`.
 ///
 /// PyTorch's caching allocator reads `device_prop.totalGlobalMem` (from `hipGetDeviceProperties`,
 /// not `hipMemGetInfo`) to compute the byte limit for `set_per_process_memory_fraction()`.
 /// Without this hook, the fraction is computed against the real 256 GiB, producing a much larger
 /// byte limit than intended and preventing OOM tests from triggering.
 ///
-/// Strategy: call the real function first (to populate all ~80 fields), then patch only
-/// `totalGlobalMem` with our spoofed limit. Three versioned symbols (bare, R0600, R0000)
-/// share this logic via [`spoof_total_global_mem`].
-unsafe fn spoof_total_global_mem(prop: *mut HipDevicePropPrefix, device_id: c_int) {
+/// Strategy: call the real function first (to populate all ~80 fields), then patch
+/// `totalGlobalMem` and `multiProcessorCount` with spoofed values. Three versioned
+/// symbols (bare, R0600, R0000) share this logic.
+unsafe fn spoof_device_properties(prop: *mut HipDevicePropPrefix, device_id: c_int) {
     let limiter = match GLOBAL_LIMITER.get() {
         Some(limiter) => limiter,
         None => return,
@@ -917,6 +935,10 @@ unsafe fn spoof_total_global_mem(prop: *mut HipDevicePropPrefix, device_id: c_in
             );
         }
     }
+
+    if let Some(&(start, end)) = crate::CU_RANGE.get() {
+        (*prop).multi_processor_count = (end - start + 1) as c_int;
+    }
 }
 
 #[hook_fn]
@@ -929,7 +951,7 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_detour(
     }
     let result = FN_HIP_GET_DEVICE_PROPERTIES(prop, device_id);
     if result == HIP_SUCCESS {
-        spoof_total_global_mem(prop, device_id);
+        spoof_device_properties(prop, device_id);
     }
     result
 }
@@ -947,7 +969,7 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_r0600_detour(
     }
     let result = FN_HIP_GET_DEVICE_PROPERTIES_R0600(prop, device_id);
     if result == HIP_SUCCESS {
-        spoof_total_global_mem(prop, device_id);
+        spoof_device_properties(prop, device_id);
     }
     result
 }
@@ -963,7 +985,7 @@ pub(crate) unsafe extern "C" fn hip_get_device_properties_r0000_detour(
     }
     let result = FN_HIP_GET_DEVICE_PROPERTIES_R0000(prop, device_id);
     if result == HIP_SUCCESS {
-        spoof_total_global_mem(prop, device_id);
+        spoof_device_properties(prop, device_id);
     }
     result
 }
@@ -1163,6 +1185,20 @@ hip_hooks! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_hip_device_prop_prefix_offsets() {
+        assert_eq!(
+            std::mem::offset_of!(HipDevicePropPrefix, total_global_mem),
+            288,
+            "totalGlobalMem offset must match hip_runtime_api.h"
+        );
+        assert_eq!(
+            std::mem::offset_of!(HipDevicePropPrefix, multi_processor_count),
+            388,
+            "multiProcessorCount offset must match hip_runtime_api.h"
+        );
+    }
 
     // --- array_format_bytes ---
 

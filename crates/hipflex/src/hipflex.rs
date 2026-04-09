@@ -61,6 +61,8 @@ static CTOR_COMPLETE: AtomicBool = AtomicBool::new(false);
 static INIT_HOOKS_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 /// BDFs from sysfs enumeration, stored for post-init verification.
 static SYSFS_BDFS: OnceLock<Vec<String>> = OnceLock::new();
+/// CU range from `FH_CU_RANGE` env var (inclusive start, inclusive end).
+static CU_RANGE: OnceLock<(u32, u32)> = OnceLock::new();
 /// Guards one-time post-init verification of sysfs vs HIP device order.
 static SYSFS_VERIFICATION_DONE: AtomicBool = AtomicBool::new(false);
 
@@ -172,8 +174,148 @@ fn build_standalone_device(
     (pci_bdf, config)
 }
 
+/// Parse `FH_CU_RANGE` env var. Format: `start-end` (inclusive CU indices).
+fn parse_cu_range(value: &str) -> Result<(u32, u32), String> {
+    let value = value.trim();
+    let parts: Vec<&str> = value.split('-').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "invalid FH_CU_RANGE format '{value}', expected 'start-end'"
+        ));
+    }
+    let start: u32 = parts[0]
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid FH_CU_RANGE start: '{}'", parts[0]))?;
+    let end: u32 = parts[1]
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid FH_CU_RANGE end: '{}'", parts[1]))?;
+    if start > end {
+        return Err(format!(
+            "invalid FH_CU_RANGE: start ({start}) > end ({end})"
+        ));
+    }
+    Ok((start, end))
+}
+
+/// Validate CU range against device topology. Clamps to the smallest device's CU count
+/// and adjusts for WGP alignment on RDNA GPUs.
+fn validate_cu_range(start: u32, end: u32, devices: &[kfd::GpuDevice]) -> (u32, u32) {
+    let mut start = start;
+    let mut end = end;
+
+    let min_cu_count = devices
+        .iter()
+        .filter_map(|d| d.cu_count)
+        .filter(|&c| c > 0)
+        .min();
+
+    let has_unknown_cu_count = devices.iter().any(|d| d.cu_count.is_none());
+    let has_zero_cu_count = devices.iter().any(|d| d.cu_count == Some(0));
+
+    if has_unknown_cu_count {
+        tracing::warn!("CU count unavailable from sysfs for some devices, skipping bounds check");
+    }
+    if has_zero_cu_count {
+        tracing::warn!(
+            "sysfs reports cu_count=0 for some devices, ignoring those for bounds check"
+        );
+    }
+
+    if let Some(cu_count) = min_cu_count {
+        if end >= cu_count {
+            tracing::warn!(
+                end_cu = end,
+                min_cu_count = cu_count,
+                "FH_CU_RANGE end exceeds smallest device CU count, clamping to {}",
+                cu_count - 1,
+            );
+            end = cu_count - 1;
+            if start > end {
+                start = end;
+            }
+        }
+    }
+
+    let needs_wgp_alignment = devices
+        .iter()
+        .any(|d| d.gfx_target_version.is_some_and(|v| v / 10000 >= 10));
+
+    if needs_wgp_alignment {
+        if !start.is_multiple_of(2) {
+            start = start.saturating_sub(1);
+            tracing::warn!(
+                "WGP mode (RDNA): rounded FH_CU_RANGE start down to {start} for WGP alignment"
+            );
+        }
+        let count = end - start + 1;
+        if !count.is_multiple_of(2) {
+            let expanded_end = end + 1;
+            let max_end = min_cu_count.map(|c| c - 1).unwrap_or(u32::MAX);
+            if expanded_end <= max_end {
+                end = expanded_end;
+                tracing::warn!(
+                    "WGP mode (RDNA): expanded FH_CU_RANGE end to {end} for WGP alignment"
+                );
+            } else if start >= 2 {
+                start -= 2;
+                end -= 1;
+                tracing::warn!(
+                    "WGP mode (RDNA): shifted FH_CU_RANGE start to {start} for WGP alignment \
+                     (could not expand end past device limit)"
+                );
+            } else {
+                tracing::warn!(
+                    "WGP mode (RDNA): cannot achieve WGP alignment for CU range {start}-{end}, \
+                     proceeding with best-effort"
+                );
+            }
+        }
+    }
+
+    (start, end)
+}
+
+/// Build the `HSA_CU_MASK` value string for all enumerated GPU devices.
+fn format_hsa_cu_mask(start: u32, end: u32, device_count: usize) -> String {
+    (0..device_count)
+        .map(|i| format!("{i}:{start}-{end}"))
+        .collect::<Vec<_>>()
+        .join(";")
+}
+
+/// Set `HSA_CU_MASK` env var for all enumerated GPU devices.
+fn apply_cu_mask(start: u32, end: u32, devices: &[kfd::GpuDevice]) {
+    let mask_str = format_hsa_cu_mask(start, end, devices.len());
+
+    // SAFETY: single-threaded init guaranteed by LIMITER_INITIALIZED Once guard.
+    // HSA_CU_MASK is only read by the HSA runtime at first HIP API call, which
+    // has not occurred yet. The variable did not exist before this call, so no
+    // concurrent getenv can race on it.
+    unsafe {
+        std::env::set_var("HSA_CU_MASK", &mask_str);
+    }
+
+    let cu_count = end - start + 1;
+    for device in devices {
+        let total = device
+            .cu_count
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        tracing::info!(
+            pci_bdf = %device.pci_bdf,
+            "CU range restriction: CUs {start}-{end} ({cu_count} of {total} CUs)"
+        );
+    }
+    tracing::info!("HSA_CU_MASK={mask_str}");
+}
+
 /// Standalone mode: parse FH_MEMORY_LIMIT, enumerate GPUs, create SHM.
-fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, String> {
+fn init_standalone_config(
+    mem_limit_str: &str,
+    cu_range: Option<(u32, u32)>,
+) -> Result<StandaloneConfig, String> {
     if mock_shm_path().is_some() {
         tracing::warn!("FH_MEMORY_LIMIT is set, ignoring FH_SHM_FILE");
     }
@@ -202,11 +344,24 @@ fn init_standalone_config(mem_limit_str: &str) -> Result<StandaloneConfig, Strin
                 uuids.push(uuid);
                 cfgs.push(config);
             }
+            if let Some((start, end)) = cu_range {
+                let (start, end) = validate_cu_range(start, end, &devices);
+                apply_cu_mask(start, end, &devices);
+                if CU_RANGE.set((start, end)).is_err() {
+                    tracing::warn!("CU_RANGE already set (unexpected re-init), spoofing will use the first value");
+                }
+            }
+
             let kfd_devs = devices;
             (uuids, cfgs, Some(enumerated), kfd_devs)
         }
         Err(e) => {
             tracing::warn!("KFD sysfs enumeration failed ({e}), falling back to HIP runtime");
+            if cu_range.is_some() {
+                tracing::warn!(
+                    "FH_CU_RANGE is set but KFD sysfs unavailable; CU masking requires KFD sysfs path"
+                );
+            }
             let hip = hiplib::hiplib();
             let device_count = hip
                 .get_device_count()
@@ -287,10 +442,20 @@ fn init_limiter() {
             return;
         }
 
+        let parsed_cu_range = env::var("FH_CU_RANGE")
+            .ok()
+            .and_then(|s| match parse_cu_range(&s) {
+                Ok(range) => Some(range),
+                Err(e) => {
+                    tracing::warn!("{e}");
+                    None
+                }
+            });
+
         // Config priority: FH_MEMORY_LIMIT (standalone) > FH_SHM_FILE (mock).
         let (config, standalone_shm, proc_slots, pre_enumerated, kfd_devices) =
             if let Ok(mem_limit_str) = env::var("FH_MEMORY_LIMIT") {
-                match init_standalone_config(&mem_limit_str) {
+                match init_standalone_config(&mem_limit_str, parsed_cu_range) {
                     Ok(sc) => (
                         sc.pod_config,
                         Some(sc.shm_handle),
@@ -304,6 +469,12 @@ fn init_limiter() {
                     }
                 }
             } else {
+                if parsed_cu_range.is_some() {
+                    tracing::warn!(
+                        "FH_CU_RANGE is set but FH_MEMORY_LIMIT is not; \
+                         CU masking requires standalone mode (FH_MEMORY_LIMIT)"
+                    );
+                }
                 match init_mock_config() {
                     Ok(config) => (config, None, None, None, Vec::new()),
                     Err(e) => {
@@ -727,5 +898,228 @@ mod tests {
              It calls strlen via PLT, causing dynamic linker re-entrancy. \
              Use cstr_starts_with instead."
         );
+    }
+
+    // --- CU range parsing ---
+
+    #[test]
+    fn test_parse_cu_range_valid() {
+        assert_eq!(parse_cu_range("0-37"), Ok((0, 37)));
+        assert_eq!(parse_cu_range("0-0"), Ok((0, 0)));
+        assert_eq!(parse_cu_range("10-75"), Ok((10, 75)));
+    }
+
+    #[test]
+    fn test_parse_cu_range_invalid_format() {
+        assert!(parse_cu_range("37").is_err());
+        assert!(parse_cu_range("0-37-50").is_err());
+        assert!(parse_cu_range("").is_err());
+        assert!(parse_cu_range("-").is_err());
+        assert!(parse_cu_range("abc-def").is_err());
+    }
+
+    #[test]
+    fn test_parse_cu_range_start_greater_than_end() {
+        assert!(parse_cu_range("37-0").is_err());
+        assert!(parse_cu_range("10-5").is_err());
+    }
+
+    // --- WGP validation ---
+
+    #[test]
+    fn test_validate_cu_range_cdna_passthrough() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(76),
+            gfx_target_version: Some(90402), // CDNA3 (MI325X) — no WGP constraint
+        }];
+        let (start, end) = validate_cu_range(0, 37, &devices);
+        assert_eq!((start, end), (0, 37));
+    }
+
+    #[test]
+    fn test_validate_cu_range_clamps_to_device() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(76),
+            gfx_target_version: Some(90402),
+        }];
+        let (start, end) = validate_cu_range(0, 100, &devices);
+        assert_eq!((start, end), (0, 75));
+    }
+
+    #[test]
+    fn test_validate_cu_range_clamps_to_smallest_device() {
+        let devices = vec![
+            kfd::GpuDevice {
+                pci_bdf: "0000:75:00.0".into(),
+                render_minor: 128,
+                gpu_id: 1,
+                cu_count: Some(76),
+                gfx_target_version: Some(90402), // CDNA3
+            },
+            kfd::GpuDevice {
+                pci_bdf: "0000:76:00.0".into(),
+                render_minor: 129,
+                gpu_id: 2,
+                cu_count: Some(32),
+                gfx_target_version: Some(90402), // CDNA3
+            },
+        ];
+        let (start, end) = validate_cu_range(0, 50, &devices);
+        assert_eq!((start, end), (0, 31));
+    }
+
+    #[test]
+    fn test_validate_cu_range_rdna_wgp_alignment() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(32),
+            gfx_target_version: Some(110000), // RDNA3 — WGP mode
+        }];
+        // start=1 rounds down to 0, count becomes 10 (even)
+        let (start, end) = validate_cu_range(1, 9, &devices);
+        assert_eq!((start, end), (0, 9));
+    }
+
+    #[test]
+    fn test_validate_cu_range_rdna_wgp_expand_end() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(32),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        // start=0 is even, count=3 is odd → end expands from 2 to 3
+        let (start, end) = validate_cu_range(0, 2, &devices);
+        assert_eq!((start, end), (0, 3));
+    }
+
+    #[test]
+    fn test_validate_cu_range_rdna_wgp_at_device_limit() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(32),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        // end=31 after clamp, start=0, count=32 (even) — no WGP fixup needed
+        let (start, end) = validate_cu_range(0, 31, &devices);
+        assert_eq!((start, end), (0, 31));
+    }
+
+    #[test]
+    fn test_validate_cu_range_rdna_wgp_expand_end_at_boundary() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(32),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        // start=0, end=30, count=31 (odd). end+1=31 == cu_count-1=31, so expand works
+        let (start, end) = validate_cu_range(0, 30, &devices);
+        assert_eq!((start, end), (0, 31));
+    }
+
+    #[test]
+    fn test_validate_cu_range_rdna_wgp_shifts_start() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(10),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        // After clamp: start=0, end=9, count=10 (even) — no WGP fixup needed.
+        // Try: start=0, end=8, count=9 (odd). end+1=9 == cu_count-1=9, expand works.
+        // Need: start=2, end=9. count=8 (even) — no fixup. Not a shift-start case.
+        // Real shift-start: start=2, cu_count=4 → clamp end to 3, count=2 (even) — no fixup.
+        // Real shift-start: cu_count=9, start=0, end=8. After clamp end=8, count=9 (odd).
+        //   expanded_end=9 > max_end=8, can't expand. start>=2, so shift: start=0-2=-2? No, start=0<2.
+        // Real shift-start: cu_count=9, start=4, end=8. count=5 (odd).
+        //   expanded_end=9 > max_end=8, can't expand. start=4>=2, shift: start=4-2=2, end=8-1=7. count=6 (even).
+        let devices2 = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(9),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        let (start, end) = validate_cu_range(4, 8, &devices2);
+        assert_eq!((start, end), (2, 7));
+    }
+
+    #[test]
+    fn test_validate_cu_range_rdna_wgp_best_effort() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(2),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        // start=0, end=1, count=2 (even) — no fixup needed. Need odd count at boundary.
+        // cu_count=3, start=0, end=2, count=3 (odd). expanded_end=3 > max=2, can't expand.
+        // start=0 < 2, can't shift. Best-effort: returns (0, 2) as-is.
+        let devices2 = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(3),
+            gfx_target_version: Some(110000), // RDNA3
+        }];
+        let (start, end) = validate_cu_range(0, 2, &devices2);
+        assert_eq!((start, end), (0, 2)); // best-effort, can't align
+    }
+
+    #[test]
+    fn test_validate_cu_range_no_cu_count() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: None,
+            gfx_target_version: None,
+        }];
+        let (start, end) = validate_cu_range(0, 37, &devices);
+        assert_eq!((start, end), (0, 37));
+    }
+
+    #[test]
+    fn test_validate_cu_range_zero_cu_count_ignored() {
+        let devices = vec![kfd::GpuDevice {
+            pci_bdf: "0000:75:00.0".into(),
+            render_minor: 128,
+            gpu_id: 12345,
+            cu_count: Some(0),
+            gfx_target_version: Some(90402),
+        }];
+        let (start, end) = validate_cu_range(0, 37, &devices);
+        assert_eq!((start, end), (0, 37));
+    }
+
+    #[test]
+    fn test_format_hsa_cu_mask_single_device() {
+        assert_eq!(format_hsa_cu_mask(0, 37, 1), "0:0-37");
+    }
+
+    #[test]
+    fn test_format_hsa_cu_mask_multi_device() {
+        assert_eq!(format_hsa_cu_mask(0, 37, 3), "0:0-37;1:0-37;2:0-37");
+    }
+
+    #[test]
+    fn test_parse_cu_range_trims_whitespace() {
+        assert_eq!(parse_cu_range("  0-37  "), Ok((0, 37)));
+        assert_eq!(parse_cu_range("0 - 37"), Ok((0, 37)));
     }
 }

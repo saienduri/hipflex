@@ -17,6 +17,10 @@ pub struct GpuDevice {
     pub render_minor: u32,
     /// KFD gpu_id — used as suffix in `/sys/class/kfd/kfd/proc/<pid>/vram_<gpu_id>`.
     pub gpu_id: u64,
+    /// Number of Compute Units (simd_count / simd_per_cu). `None` if fields missing (CPU node or older kernel).
+    pub cu_count: Option<u32>,
+    /// GFX target version (e.g. 90402 = gfx942/CDNA3 MI325X). `None` if missing.
+    pub gfx_target_version: Option<u32>,
 }
 
 /// Parsed fields from a KFD topology node's `properties` file.
@@ -25,6 +29,9 @@ pub struct NodeProperties {
     pub domain: u32,
     pub location_id: u32,
     pub drm_render_minor: u32,
+    pub simd_count: Option<u32>,
+    pub simd_per_cu: Option<u32>,
+    pub gfx_target_version: Option<u32>,
 }
 
 /// Errors that can occur during GPU enumeration.
@@ -73,6 +80,9 @@ pub fn parse_properties(content: &str) -> Result<NodeProperties, EnumerationErro
     let mut domain: Option<u32> = None;
     let mut location_id: Option<u32> = None;
     let mut drm_render_minor: Option<u32> = None;
+    let mut simd_count: Option<u32> = None;
+    let mut simd_per_cu: Option<u32> = None;
+    let mut gfx_target_version: Option<u32> = None;
 
     let parse_u32 = |key: &str, value: &str| -> Result<u32, EnumerationError> {
         value
@@ -89,6 +99,9 @@ pub fn parse_properties(content: &str) -> Result<NodeProperties, EnumerationErro
             "domain" => domain = Some(parse_u32(key, value)?),
             "location_id" => location_id = Some(parse_u32(key, value)?),
             "drm_render_minor" => drm_render_minor = Some(parse_u32(key, value)?),
+            "simd_count" => simd_count = Some(parse_u32(key, value)?),
+            "simd_per_cu" => simd_per_cu = Some(parse_u32(key, value)?),
+            "gfx_target_version" => gfx_target_version = Some(parse_u32(key, value)?),
             _ => {}
         }
     }
@@ -99,6 +112,9 @@ pub fn parse_properties(content: &str) -> Result<NodeProperties, EnumerationErro
             .ok_or_else(|| EnumerationError::MissingField("location_id".into()))?,
         drm_render_minor: drm_render_minor
             .ok_or_else(|| EnumerationError::MissingField("drm_render_minor".into()))?,
+        simd_count,
+        simd_per_cu,
+        gfx_target_version,
     })
 }
 
@@ -170,10 +186,16 @@ pub fn enumerate_gpu_devices_from(
         }
 
         let pci_bdf = decode_pci_bdf(props.domain, props.location_id);
+        let cu_count = match (props.simd_count, props.simd_per_cu) {
+            (Some(simds), Some(per_cu)) if per_cu > 0 => Some(simds / per_cu),
+            _ => None,
+        };
         devices.push(GpuDevice {
             pci_bdf,
             render_minor: props.drm_render_minor,
             gpu_id,
+            cu_count,
+            gfx_target_version: props.gfx_target_version,
         });
     }
 
@@ -417,7 +439,7 @@ simd_arrays_per_engine 2
 cu_per_simd_array 2
 simd_per_cu 4
 max_slots_scratch_cu 32
-gfx_target_version 120100
+gfx_target_version 90402
 vendor_id 4098
 device_id 29856
 location_id 29952
@@ -442,6 +464,35 @@ unique_id 9895604649984";
         assert_eq!(props.domain, 0);
         assert_eq!(props.location_id, 29952);
         assert_eq!(props.drm_render_minor, 128);
+        assert_eq!(props.simd_count, Some(304));
+        assert_eq!(props.simd_per_cu, Some(4));
+        assert_eq!(props.gfx_target_version, Some(90402));
+    }
+
+    #[test]
+    fn test_parse_properties_cu_count() {
+        let content = "\
+domain 0
+location_id 29952
+drm_render_minor 128
+simd_count 304
+simd_per_cu 4
+gfx_target_version 90402";
+
+        let props = parse_properties(content).unwrap();
+        // cu_count is computed in enumerate, but we can verify the raw fields
+        assert_eq!(props.simd_count, Some(304));
+        assert_eq!(props.simd_per_cu, Some(4));
+        // 304 / 4 = 76 CUs — verified by enumerate_gpu_devices_from
+    }
+
+    #[test]
+    fn test_parse_properties_no_cu_fields() {
+        let content = "domain 0\nlocation_id 29952\ndrm_render_minor 128\n";
+        let props = parse_properties(content).unwrap();
+        assert_eq!(props.simd_count, None);
+        assert_eq!(props.simd_per_cu, None);
+        assert_eq!(props.gfx_target_version, None);
     }
 
     #[test]
@@ -509,6 +560,27 @@ unique_id 9895604649984";
         assert_eq!(devices[0].pci_bdf, "0000:75:00.0");
         assert_eq!(devices[0].render_minor, 128);
         assert_eq!(devices[0].gpu_id, 12345);
+        assert_eq!(devices[0].cu_count, None);
+        assert_eq!(devices[0].gfx_target_version, None);
+    }
+
+    #[test]
+    fn test_enumerate_gpu_with_cu_count() {
+        let tmp = tempfile::tempdir().unwrap();
+        let topology = tmp.path().join("nodes");
+        let dri = tmp.path().join("dri");
+        fs::create_dir_all(&topology).unwrap();
+        fs::create_dir_all(&dri).unwrap();
+
+        create_node(&topology, 0, 0, None);
+        let props = "domain 0\nlocation_id 29952\ndrm_render_minor 128\nsimd_count 304\nsimd_per_cu 4\ngfx_target_version 90402\n";
+        create_node(&topology, 1, 12345, Some(props));
+        create_render_device(&dri, 128);
+
+        let devices = enumerate_gpu_devices_from(&topology, &dri).unwrap();
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].cu_count, Some(76)); // 304 / 4
+        assert_eq!(devices[0].gfx_target_version, Some(90402));
     }
 
     #[test]
@@ -630,6 +702,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 51110,
+            cu_count: None,
+            gfx_target_version: None,
         }];
         create_kfd_vram_file(&kfd_proc, 1234, 51110, 1_073_741_824);
 
@@ -647,21 +721,29 @@ unique_id 9895604649984";
                 pci_bdf: "0000:05:00.0".into(),
                 render_minor: 128,
                 gpu_id: 51110,
+                cu_count: None,
+                gfx_target_version: None,
             },
             GpuDevice {
                 pci_bdf: "0000:46:00.0".into(),
                 render_minor: 129,
                 gpu_id: 22099,
+                cu_count: None,
+                gfx_target_version: None,
             },
             GpuDevice {
                 pci_bdf: "0000:85:00.0".into(),
                 render_minor: 130,
                 gpu_id: 39621,
+                cu_count: None,
+                gfx_target_version: None,
             },
             GpuDevice {
                 pci_bdf: "0000:c6:00.0".into(),
                 render_minor: 131,
                 gpu_id: 47737,
+                cu_count: None,
+                gfx_target_version: None,
             },
         ];
         create_kfd_vram_file(&kfd_proc, 100, 51110, 5_000_000_000);
@@ -689,6 +771,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 51110,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         let result = read_kfd_vram_for_pid_from(nonexistent, 9999, &devices);
@@ -715,6 +799,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 51110,
+            cu_count: None,
+            gfx_target_version: None,
         }];
         let result = read_kfd_vram_for_pid_from(&kfd_proc, 1234, &devices);
         assert!(result.is_empty());
@@ -744,6 +830,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 9091,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         let result = resolve_host_pid_with(our_pid, &kfd_proc, &host_proc, &devices);
@@ -775,6 +863,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 9091,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         let result = resolve_host_pid_with(42, &kfd_proc, &host_proc, &devices);
@@ -792,6 +882,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 9091,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         let result = resolve_host_pid_with(42, &kfd_proc, &nonexistent, &devices);
@@ -817,6 +909,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 9091,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         let result = resolve_host_pid_with(42, &kfd_proc, &host_proc, &devices);
@@ -838,6 +932,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 9091,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         // Single NSpid = no namespace nesting, skip (need len >= 2).
@@ -864,6 +960,8 @@ unique_id 9895604649984";
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 9091,
+            cu_count: None,
+            gfx_target_version: None,
         }];
 
         // Container PID is 1 (innermost), should resolve to host PID 1287304.

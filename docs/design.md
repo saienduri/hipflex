@@ -1,6 +1,6 @@
 # hipflex Design
 
-A cdylib loaded via `LD_PRELOAD` that intercepts HIP GPU memory allocation APIs, enforces per-process VRAM limits, and tracks usage through shared memory.
+A cdylib loaded via `LD_PRELOAD` that intercepts HIP GPU memory allocation APIs, enforces per-process VRAM limits, restricts Compute Unit access, and tracks usage through shared memory.
 
 ## How It Works
 
@@ -16,7 +16,7 @@ LD_PRELOAD → libhipflex.so (Frida GUM inline hooks)
         └─ On free: take from DashMap, call native free, saturating_fetch_sub on SHM
 ```
 
-The limiter is transparent to applications. Frameworks see the configured VRAM limit as the total GPU memory (via spoofed `hipMemGetInfo`/`hipDeviceTotalMem`/SMI queries), and allocations that exceed the limit return `hipErrorOutOfMemory`.
+The limiter is transparent to applications. Frameworks see the configured VRAM limit as the total GPU memory (via spoofed `hipMemGetInfo`/`hipDeviceTotalMem`/SMI queries), and allocations that exceed the limit return `hipErrorOutOfMemory`. When `FH_CU_RANGE` is set, `multiProcessorCount` in `hipGetDeviceProperties` is spoofed to match the restricted CU count.
 
 ## Operating Modes
 
@@ -33,11 +33,13 @@ Enables VRAM enforcement with just `LD_PRELOAD` + `FH_MEMORY_LIMIT` — no daemo
 
 Init flow:
 1. Parse `FH_MEMORY_LIMIT` via `size_parser::parse_memory_limit()` → bytes
-2. Enumerate all visible GPUs via KFD sysfs (`/sys/class/kfd/kfd/topology/nodes/`), falling back to HIP runtime if sysfs fails
-3. Build `DeviceConfig` per GPU with `mem_limit` from env var
-4. Create SHM via `SharedMemoryHandle::create(shm_path, &configs)` at `{SHM_PATH}/shm` (default `/dev/shm/hipflex/shm`). If SHM already exists, joins it without reinitializing — preserving runtime state from concurrent processes
-5. Claim a proc slot for per-process overhead tracking
-6. Install Frida GUM hooks on `libamdhip64.so`
+2. Parse `FH_CU_RANGE` (if set) via `parse_cu_range()` → `(start, end)` inclusive CU indices
+3. Enumerate all visible GPUs via KFD sysfs (`/sys/class/kfd/kfd/topology/nodes/`), falling back to HIP runtime if sysfs fails
+4. If `FH_CU_RANGE` is set and KFD sysfs succeeded: validate the range against device topology (clamp to smallest device's CU count, WGP-align on RDNA), set `HSA_CU_MASK` env var, store validated range for `multiProcessorCount` spoofing
+5. Build `DeviceConfig` per GPU with `mem_limit` from env var
+6. Create SHM via `SharedMemoryHandle::create(shm_path, &configs)` at `{SHM_PATH}/shm` (default `/dev/shm/hipflex/shm`). If SHM already exists, joins it without reinitializing — preserving runtime state from concurrent processes
+7. Claim a proc slot for per-process overhead tracking
+8. Install Frida GUM hooks on `libamdhip64.so`
 
 **SHM multi-process safety:** `create()` handles the race where the segment already exists by opening it instead of failing. Only the first creator writes initial state; subsequent joiners preserve existing runtime counters so concurrent processes don't stomp each other's `pod_memory_used`.
 
@@ -148,6 +150,26 @@ Each compiled kernel contributes ~1–50 MiB as a code object in VRAM. The overh
 
 **All-devices reconciliation:** A single KFD sysfs read and DashMap pass updates overhead and effective limits for ALL mapped devices — not just the device being allocated on. This prevents stale effective limits on multi-GPU setups.
 
+## CU Masking (Compute Restriction)
+
+`FH_CU_RANGE=start-end` restricts which GPU Compute Units a process can use. This is hardware-enforced via `HSA_CU_MASK` — the ROCr runtime applies the mask to all HSA queues, covering user kernels, blit engine operations, memset/memcpy, and graph replay.
+
+**How it works:**
+
+1. `FH_CU_RANGE` is parsed during `init_limiter()` alongside `FH_MEMORY_LIMIT`
+2. After KFD sysfs enumeration, the range is validated against device topology:
+   - Clamped to the smallest device's CU count across all visible GPUs
+   - On RDNA GPUs (`gfx_target_version` major >= 10), start is rounded down and count is expanded to WGP-aligned boundaries (2-CU granularity). CDNA GPUs (MI300X/MI325X) have individual CU granularity
+3. `HSA_CU_MASK` is set via `setenv` before any HIP API call triggers HSA runtime initialization. Format: `GPU_IDX:START-END` with `;` separating GPUs (e.g., `0:0-37;1:0-37`)
+4. `hipGetDeviceProperties` is hooked to report `multiProcessorCount = end - start + 1`, so frameworks see the restricted CU count
+
+**Topology parsing:** KFD sysfs provides `simd_count`, `simd_per_cu`, and `gfx_target_version` per GPU node. CU count is `simd_count / simd_per_cu`. `gfx_target_version / 10000` gives the architecture major version (>= 10 = RDNA/WGP mode, < 10 = CDNA/CU mode).
+
+**Limitations:**
+- Requires `FH_MEMORY_LIMIT` (standalone mode). `FH_CU_RANGE` without `FH_MEMORY_LIMIT` logs a warning and is ignored
+- Requires KFD sysfs. If sysfs enumeration fails, CU masking is skipped with a warning
+- `HSA_CU_MASK` operates at the HSA/KFD level below HIP's stream abstraction — `hipExtStreamGetCUMask` on a regular stream will still show all CUs. The restriction is enforced at the hardware queue level
+
 ## Process Lifecycle
 
 **Clean exit:** An `atexit` handler (`drain_allocations`) iterates the process-local `allocation_tracker`, aggregates per-device totals, and does one bulk `saturating_fetch_sub` per device. This handles frameworks like PyTorch whose caching allocator may not free all GPU memory before process exit.
@@ -234,6 +256,10 @@ AMD GPU UUIDs are PCI BDF-based. `normalize_uuid_to_bdf()` unifies naming conven
 | **Invalid `FH_MEMORY_LIMIT`** | Limiter not initialized, all hooks passthrough. |
 | **`FH_MEMORY_LIMIT` with no visible GPUs** | Limiter not initialized. Logged as error. |
 | **SHM directory not writable** | Limiter not initialized, passthrough. |
+| **Invalid `FH_CU_RANGE`** | Warning logged, CU masking skipped. Memory enforcement still active. |
+| **`FH_CU_RANGE` without `FH_MEMORY_LIMIT`** | Warning logged, CU masking ignored (requires standalone mode). |
+| **`FH_CU_RANGE` exceeds device CUs** | Clamped to device CU count with a warning. |
+| **KFD sysfs unavailable with `FH_CU_RANGE`** | CU masking skipped (cannot validate range or set `HSA_CU_MASK`). |
 
 ## Components
 

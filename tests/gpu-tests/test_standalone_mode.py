@@ -10,75 +10,11 @@ Key behaviors under test:
   - Multiple allocations are tracked across a process lifetime
 """
 
-import os
-import sys
-import subprocess
-import tempfile
-import textwrap
-
 import pytest
 
-from conftest import DEFAULT_HIPFLEX_LIB, SUBPROCESS_TIMEOUT, requires_gpu
+from conftest import run_standalone, requires_gpu
 
 pytestmark = requires_gpu
-
-
-def _standalone_env(shm_dir: str, mem_limit: str = "1G", extra_env: dict = None):
-    """Build env dict for standalone mode."""
-    env = os.environ.copy()
-    env["LD_PRELOAD"] = DEFAULT_HIPFLEX_LIB
-    env["FH_MEMORY_LIMIT"] = mem_limit
-    env["FH_SHM_PATH"] = shm_dir
-    env["FH_ENABLE_HOOKS"] = "true"
-    env["RUST_LOG"] = env.get("RUST_LOG", "hipflex=debug")
-
-    # Ensure mock mode env vars are NOT set
-    env.pop("FH_SHM_FILE", None)
-    env.pop("FH_VISIBLE_DEVICES", None)
-    env.pop("HYPERVISOR_IP", None)
-    env.pop("HYPERVISOR_PORT", None)
-
-    cts_dir = os.path.dirname(os.path.abspath(__file__))
-    env["PYTHONPATH"] = cts_dir
-
-    if extra_env:
-        for key, value in extra_env.items():
-            if value is None:
-                env.pop(key, None)
-            else:
-                env[key] = value
-
-    return env
-
-
-def _run_standalone(script: str, mem_limit: str = "1G",
-                    extra_env: dict = None, timeout: int = SUBPROCESS_TIMEOUT):
-    """Run a script with FH_MEMORY_LIMIT standalone mode (no SHM file)."""
-    with tempfile.TemporaryDirectory(prefix="cts_standalone_") as tmpdir:
-        shm_dir = os.path.join(tmpdir, "shm")
-        os.makedirs(shm_dir, exist_ok=True)
-        env = _standalone_env(shm_dir, mem_limit, extra_env)
-
-        cts_dir = os.path.dirname(os.path.abspath(__file__))
-        script_path = os.path.join(tmpdir, "test_script.py")
-        with open(script_path, "w") as f:
-            f.write(textwrap.dedent(script))
-
-        try:
-            proc = subprocess.run(
-                [sys.executable, script_path],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-                cwd=cts_dir,
-            )
-            return proc
-        except subprocess.TimeoutExpired as e:
-            pytest.fail(
-                f"Standalone test timed out after {timeout}s\n"
-                f"stdout: {e.stdout}\nstderr: {e.stderr}"
-            )
 
 
 class TestStandaloneAllocation:
@@ -86,7 +22,7 @@ class TestStandaloneAllocation:
 
     def test_alloc_within_limit(self):
         """A small allocation should succeed when under the limit."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -100,7 +36,7 @@ class TestStandaloneAllocation:
 
     def test_alloc_over_limit_denied(self):
         """An allocation exceeding the limit should be denied with OOM."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime, HIP_ERROR_OUT_OF_MEMORY
 
             hip = HIPRuntime()
@@ -116,7 +52,7 @@ class TestStandaloneAllocation:
 
     def test_alloc_free_alloc_cycle(self):
         """Allocate, free, allocate again — accounting should allow reuse."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -142,7 +78,7 @@ class TestStandaloneSpoofing:
 
     def test_mem_get_info_reports_limit(self):
         """hipMemGetInfo should report total == FH_MEMORY_LIMIT."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -161,7 +97,7 @@ class TestStandaloneSpoofing:
 
     def test_device_total_mem_reports_limit(self):
         """hipDeviceTotalMem should report FH_MEMORY_LIMIT."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -179,7 +115,7 @@ class TestStandaloneSpoofing:
 
     def test_free_decreases_after_alloc(self):
         """hipMemGetInfo free should decrease after allocation."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -210,7 +146,7 @@ class TestStandaloneSizeFormats:
 
     def test_gib_format(self):
         """126GiB should be parsed correctly."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -228,7 +164,7 @@ class TestStandaloneSizeFormats:
 
     def test_plain_bytes_format(self):
         """Plain byte count should work."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -250,7 +186,7 @@ class TestStandaloneEdgeCases:
 
     def test_invalid_limit_passthrough(self):
         """Invalid FH_MEMORY_LIMIT should cause limiter to not init (passthrough)."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -269,7 +205,7 @@ class TestStandaloneEdgeCases:
 
     def test_zero_limit_passthrough(self):
         """FH_MEMORY_LIMIT=0G is unparseable (zero value), so limiter does not init."""
-        proc = _run_standalone("""
+        proc = run_standalone("""
             from hip_helper import HIPRuntime
 
             hip = HIPRuntime()
@@ -332,7 +268,7 @@ class TestStandaloneForkSafety:
                 assert exit_code == 0, f"Child exited with code {exit_code}"
                 print("PARENT_OK: child fork+HIP succeeded")
         """
-        result = _run_standalone(script, mem_limit="1G",
+        result = run_standalone(script, mem_limit="1G",
                                  extra_env={"FH_LOG_LEVEL": "hipflex=debug",
                                             "FH_LOG_PATH": "stderr"})
         assert result.returncode == 0, f"Fork safety test failed:\n{result.stderr}"
@@ -354,7 +290,7 @@ class TestStandaloneForkSafety:
             hip.free(ptr)
             print("PASS")
         """
-        result = _run_standalone(script, mem_limit=mem_limit,
+        result = run_standalone(script, mem_limit=mem_limit,
                                  extra_env={"FH_LOG_LEVEL": "hipflex=debug",
                                             "FH_LOG_PATH": "stderr"})
         assert result.returncode == 0, f"Failed: {result.stderr}"
@@ -393,7 +329,7 @@ def test_high_overhead_warning():
             hip.free(p)
         print("PASS")
     """
-    result = _run_standalone(script, mem_limit="3M",
+    result = run_standalone(script, mem_limit="3M",
                              extra_env={"FH_LOG_PATH": "stderr"})
     assert result.returncode == 0, f"Failed: {result.stderr}"
     output = result.stdout + result.stderr

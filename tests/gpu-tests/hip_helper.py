@@ -556,6 +556,19 @@ class HIPRuntime:
         total_global_mem = c_size_t.from_buffer_copy(buf, 288)
         return total_global_mem.value
 
+    def get_device_properties_multi_processor_count(self, device: int = 0) -> int:
+        """Get multiProcessorCount from hipGetDeviceProperties for a specific device.
+
+        multiProcessorCount is an int at offset 388 in hipDeviceProp_t.
+        """
+        buf = (c_char * 4096)()
+        self._check(
+            self._lib.hipGetDeviceProperties(byref(buf), device),
+            "hipGetDeviceProperties",
+        )
+        mp_count = c_int.from_buffer_copy(buf, 388)
+        return mp_count.value
+
     # --- Array allocation wrappers ---
 
     def malloc_array(self, width: int, height: int = 0,

@@ -455,3 +455,85 @@ def cts_no_hooks():
     fixture.setup()
     yield fixture
     fixture.teardown()
+
+
+# ── Standalone mode helpers ──
+# Used by test_standalone_mode.py, test_cu_mask.py, and any future standalone-mode tests.
+
+
+def standalone_env(shm_dir: str, mem_limit: str = "1G", cu_range: str = None,
+                   extra_env: dict = None):
+    """Build env dict for standalone mode (FH_MEMORY_LIMIT, no SHM file).
+
+    Args:
+        shm_dir: Directory for SHM file creation.
+        mem_limit: Memory limit string (e.g., "1G", "24G").
+        cu_range: Optional CU range (e.g., "0-37").
+        extra_env: Additional env vars. A value of None removes the key.
+    """
+    env = os.environ.copy()
+    env["LD_PRELOAD"] = DEFAULT_HIPFLEX_LIB
+    env["FH_MEMORY_LIMIT"] = mem_limit
+    env["FH_SHM_PATH"] = shm_dir
+    env["FH_ENABLE_HOOKS"] = "true"
+    env["RUST_LOG"] = env.get("RUST_LOG", "hipflex=debug")
+
+    # Ensure mock mode env vars are NOT set
+    env.pop("FH_SHM_FILE", None)
+    env.pop("FH_VISIBLE_DEVICES", None)
+    env.pop("HYPERVISOR_IP", None)
+    env.pop("HYPERVISOR_PORT", None)
+
+    if cu_range is not None:
+        env["FH_CU_RANGE"] = cu_range
+
+    cts_dir = os.path.dirname(os.path.abspath(__file__))
+    env["PYTHONPATH"] = cts_dir
+
+    if extra_env:
+        for key, value in extra_env.items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
+
+    return env
+
+
+def run_standalone(script: str, mem_limit: str = "1G", cu_range: str = None,
+                   extra_env: dict = None, timeout: int = SUBPROCESS_TIMEOUT):
+    """Run a script with FH_MEMORY_LIMIT standalone mode.
+
+    Returns a SubprocessResult (consistent with CTSFixture.run_hip_test).
+    """
+    with tempfile.TemporaryDirectory(prefix="cts_standalone_") as tmpdir:
+        shm_dir = os.path.join(tmpdir, "shm")
+        os.makedirs(shm_dir, exist_ok=True)
+        env = standalone_env(shm_dir, mem_limit, cu_range, extra_env)
+
+        script_path = os.path.join(tmpdir, "test_script.py")
+        with open(script_path, "w") as f:
+            f.write(textwrap.dedent(script))
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, script_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                cwd=os.path.dirname(os.path.abspath(__file__)),
+            )
+            return SubprocessResult(
+                returncode=proc.returncode,
+                stdout=proc.stdout,
+                stderr=proc.stderr,
+                output=proc.stdout + proc.stderr,
+            )
+        except subprocess.TimeoutExpired as exc:
+            return SubprocessResult(
+                returncode=-1,
+                stdout=exc.stdout.decode() if exc.stdout else "",
+                stderr=exc.stderr.decode() if exc.stderr else f"TIMEOUT after {timeout}s",
+                output=f"TIMEOUT after {timeout}s",
+            )

@@ -22,7 +22,7 @@ All 27 HIP hooks are declared in a single `hip_hooks!` macro table (`detour/mem.
 
 **Free (7):** hipFree, hipFreeAsync, hipMemRelease, hipFreeArray, hipArrayDestroy, hipFreeMipmappedArray, hipMipmappedArrayDestroy
 
-**Spoofing — inline (5):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties, hipGetDevicePropertiesR0600, hipGetDevicePropertiesR0000 (Frida GUM + LD_PRELOAD export)
+**Spoofing — inline (5):** hipMemGetInfo, hipDeviceTotalMem, hipGetDeviceProperties, hipGetDevicePropertiesR0600, hipGetDevicePropertiesR0000 (Frida GUM + LD_PRELOAD export). The `hipGetDeviceProperties` variants spoof both `totalGlobalMem` (memory limit) and `multiProcessorCount` (CU range, when `FH_CU_RANGE` is set)
 
 **Spoofing — dlsym-level (3):** rsmi_dev_memory_total_get, amdsmi_get_gpu_memory_total, amdsmi_get_gpu_vram_info
 

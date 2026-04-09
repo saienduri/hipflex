@@ -1,8 +1,8 @@
 # hipflex Demo
 
-Run any GPU workload with a hard VRAM limit — no code changes, no driver mods. Just `LD_PRELOAD`.
+Run any GPU workload with a hard VRAM limit and optional compute restriction — no code changes, no driver mods. Just `LD_PRELOAD`.
 
-hipflex intercepts HIP memory APIs at the library level and enforces per-process VRAM limits transparently. Frameworks like PyTorch, vLLM, and SGLang see your configured limit as the GPU's total memory. An MI325X with 256 GiB of VRAM becomes a 24 GiB GPU — and every framework adapts automatically.
+hipflex intercepts HIP APIs at the library level and enforces per-process VRAM limits and CU restrictions transparently. Frameworks like PyTorch, vLLM, and SGLang see your configured limit as the GPU's total memory and CU count. An MI325X with 256 GiB / 304 CUs becomes a 24 GiB / 38 CU GPU — and every framework adapts automatically.
 
 ## Setup
 
@@ -18,6 +18,9 @@ wget -q https://github.com/saienduri/hipflex/releases/download/v0.1.0/libhipflex
 ```bash
 # Limit any GPU process to 24 GiB of VRAM
 LD_PRELOAD=./libhipflex.so FH_MEMORY_LIMIT=24GiB python3 your_script.py
+
+# Limit memory AND restrict to 38 Compute Units
+LD_PRELOAD=./libhipflex.so FH_MEMORY_LIMIT=24GiB FH_CU_RANGE=0-37 python3 your_script.py
 ```
 
 ---
@@ -241,31 +244,35 @@ SGLang reads `hipMemGetInfo` at startup to determine its token budget. With 24 G
 
 ## The Key Insight
 
-Every framework queries GPU memory the same way: `hipMemGetInfo`, `hipDeviceTotalMem`, `hipGetDeviceProperties`. hipflex intercepts all of these and reports your configured limit. The frameworks never know they're on a fractionalized GPU — they just see a smaller one and adapt.
+Every framework queries GPU capabilities the same way: `hipMemGetInfo`, `hipDeviceTotalMem`, `hipGetDeviceProperties`. hipflex intercepts all of these and reports your configured limits. The frameworks never know they're on a fractionalized GPU — they just see a smaller one and adapt.
 
-| Metric | Without hipflex | With hipflex (24 GiB) |
-|--------|----------------|----------------------|
+| Metric | Without hipflex | With hipflex (24 GiB, 38 CUs) |
+|--------|----------------|-------------------------------|
 | `torch.cuda.mem_get_info()` total | 256.0 GiB | 24.0 GiB |
+| `hipGetDeviceProperties` multiProcessorCount | 304 | 38 |
 | `rocm-smi --showmeminfo vram` total | 256 GiB | 24 GiB |
 | `amd-smi static` VRAM size | 256 GiB | 24 GiB |
 | vLLM KV cache allocation | ~200 GiB | 2.7 GiB |
 | SGLang token budget | ~400K tokens | 37K tokens |
 | Allocation beyond limit | Succeeds | `hipErrorOutOfMemory` |
+| Compute Units available | 304 | 38 (hardware-enforced via `HSA_CU_MASK`) |
 
 ## How It Works
 
 hipflex uses `LD_PRELOAD` to intercept 27 HIP memory APIs (`hipMalloc`, `hipFree`, `hipMemGetInfo`, etc.) before they reach the GPU driver:
 
-1. **Enforces limits** — allocations that would exceed `FH_MEMORY_LIMIT` are denied with `hipErrorOutOfMemory`
-2. **Spoofs memory info** — `hipMemGetInfo`, `hipDeviceTotalMem`, `hipGetDeviceProperties`, `rocm-smi`, and `amd-smi` all report the configured limit
-3. **Tracks overhead** — kernel-level VRAM usage (page tables, code objects, scratch buffers) is tracked via KFD sysfs and subtracted from the budget
-4. **Drains on exit** — when the process exits, hipflex returns all tracked allocations to the shared memory counter
+1. **Enforces memory limits** — allocations that would exceed `FH_MEMORY_LIMIT` are denied with `hipErrorOutOfMemory`
+2. **Restricts compute** — `FH_CU_RANGE` sets `HSA_CU_MASK` before the HIP runtime initializes, hardware-limiting which Compute Units the process can use
+3. **Spoofs device info** — `hipMemGetInfo`, `hipDeviceTotalMem`, `hipGetDeviceProperties` (including `multiProcessorCount`), `rocm-smi`, and `amd-smi` all report the configured limits
+4. **Tracks overhead** — kernel-level VRAM usage (page tables, code objects, scratch buffers) is tracked via KFD sysfs and subtracted from the budget
+5. **Drains on exit** — when the process exits, hipflex returns all tracked allocations to the shared memory counter
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FH_MEMORY_LIMIT` | *(none)* | VRAM limit per GPU (e.g., `24GiB`, `8G`, `4096M`) |
+| `FH_CU_RANGE` | *(none)* | CU restriction (e.g., `0-37` for 38 CUs). Sets `HSA_CU_MASK` and spoofs `multiProcessorCount`. Requires `FH_MEMORY_LIMIT` (standalone mode) |
 | `FH_LOG_PATH` | *(none)* | Log output: `stderr`, or a file path |
 | `FH_HIP_LIB_PATH` | `libamdhip64.so` | Path to HIP runtime library |
 | `FH_ENABLE_HOOKS` | `true` | Set to `false` to disable all hooks |
