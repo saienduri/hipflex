@@ -42,6 +42,14 @@ impl Drop for DetourGuard {
     }
 }
 
+/// Log a device-context fallback, suppressing `LimiterNotInitialized` which is expected
+/// in CU-only mode (no memory enforcement, hooks pass through to native).
+fn log_device_context_fallback(error: &Error, context: &str) {
+    if !matches!(error, Error::LimiterNotInitialized) {
+        tracing::warn!("{context}: {error}, falling back to native call");
+    }
+}
+
 /// hipPitchedPtr — FFI struct populated by hipMalloc3D.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -170,7 +178,7 @@ macro_rules! check_and_alloc {
                 }
             }
             Err(error) => {
-                tracing::warn!("Device context error: {error}, falling back to native call");
+                log_device_context_fallback(&error, "Device context error");
                 $alloc_fn()
             }
         }
@@ -288,7 +296,7 @@ macro_rules! check_and_alloc_pitched {
                 Err(error) => handle_reserve_error(error, $alloc_name),
             },
             Err(error) => {
-                tracing::warn!("Device context error: {error}, falling back to native {}", $alloc_name);
+                log_device_context_fallback(&error, $alloc_name);
                 $native_call
             }
         }
@@ -864,7 +872,7 @@ pub(crate) unsafe extern "C" fn hip_mem_get_info_detour(
             }
         },
         Err(error) => {
-            tracing::warn!("Device context error: {error}, falling back to native call");
+            log_device_context_fallback(&error, "hipMemGetInfo");
             FN_HIP_MEM_GET_INFO(free, total)
         }
     }
@@ -878,7 +886,7 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
     let limiter = match GLOBAL_LIMITER.get() {
         Some(limiter) => limiter,
         None => {
-            crate::report_limiter_not_initialized();
+            log_device_context_fallback(&Error::LimiterNotInitialized, "hipDeviceTotalMem");
             return FN_HIP_DEVICE_TOTAL_MEM(bytes, device);
         }
     };
@@ -913,26 +921,26 @@ pub(crate) unsafe extern "C" fn hip_device_total_mem_detour(
 /// `totalGlobalMem` and `multiProcessorCount` with spoofed values. Three versioned
 /// symbols (bare, R0600, R0000) share this logic.
 unsafe fn spoof_device_properties(prop: *mut HipDevicePropPrefix, device_id: c_int) {
-    let limiter = match GLOBAL_LIMITER.get() {
-        Some(limiter) => limiter,
-        None => return,
-    };
-
-    let device_idx = match limiter.device_index_by_hip_device(device_id) {
-        Ok(idx) => idx,
-        Err(_) => return,
-    };
-
-    match limiter.get_pod_memory_usage(device_idx) {
-        Ok((_used, limit)) => {
-            (*prop).total_global_mem = limit as usize;
-        }
-        Err(e) => {
-            tracing::warn!(
-                device_id,
-                ?e,
-                "hipGetDeviceProperties: failed to get pod memory usage, returning unpatched"
-            );
+    if let Some(limiter) = GLOBAL_LIMITER.get() {
+        match limiter.device_index_by_hip_device(device_id) {
+            Ok(device_idx) => match limiter.get_pod_memory_usage(device_idx) {
+                Ok((_used, limit)) => {
+                    (*prop).total_global_mem = limit as usize;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        device_id,
+                        ?e,
+                        "hipGetDeviceProperties: failed to get pod memory usage, returning unpatched"
+                    );
+                }
+            },
+            Err(_) => {
+                tracing::debug!(
+                    device_id,
+                    "hipGetDeviceProperties: device not in limiter config, memory unpatched"
+                );
+            }
         }
     }
 

@@ -23,7 +23,7 @@ Design decision — inline subprocess scripts:
   with no isolation benefit (the subprocess boundary already provides that).
 """
 
-import json
+
 import os
 import shutil
 import struct
@@ -463,18 +463,22 @@ def cts_no_hooks():
 
 def standalone_env(shm_dir: str, mem_limit: str = "1G", cu_range: str = None,
                    extra_env: dict = None):
-    """Build env dict for standalone mode (FH_MEMORY_LIMIT, no SHM file).
+    """Build env dict for standalone or CU-only mode.
 
     Args:
-        shm_dir: Directory for SHM file creation.
-        mem_limit: Memory limit string (e.g., "1G", "24G").
+        shm_dir: Directory for SHM file creation (used only when mem_limit is set).
+        mem_limit: Memory limit string (e.g., "1G", "24G"). None for CU-only mode.
         cu_range: Optional CU range (e.g., "0-37").
         extra_env: Additional env vars. A value of None removes the key.
     """
     env = os.environ.copy()
     env["LD_PRELOAD"] = DEFAULT_HIPFLEX_LIB
-    env["FH_MEMORY_LIMIT"] = mem_limit
-    env["FH_SHM_PATH"] = shm_dir
+    if mem_limit is not None:
+        env["FH_MEMORY_LIMIT"] = mem_limit
+        env["FH_SHM_PATH"] = shm_dir
+    else:
+        env.pop("FH_MEMORY_LIMIT", None)
+        env.pop("FH_SHM_PATH", None)
     env["FH_ENABLE_HOOKS"] = "true"
     env["RUST_LOG"] = env.get("RUST_LOG", "hipflex=debug")
 
@@ -502,7 +506,7 @@ def standalone_env(shm_dir: str, mem_limit: str = "1G", cu_range: str = None,
 
 def run_standalone(script: str, mem_limit: str = "1G", cu_range: str = None,
                    extra_env: dict = None, timeout: int = SUBPROCESS_TIMEOUT):
-    """Run a script with FH_MEMORY_LIMIT standalone mode.
+    """Run a script in standalone mode (FH_MEMORY_LIMIT) or CU-only mode (mem_limit=None).
 
     Returns a SubprocessResult (consistent with CTSFixture.run_hip_test).
     """

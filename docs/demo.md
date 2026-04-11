@@ -19,7 +19,10 @@ wget -q https://github.com/saienduri/hipflex/releases/download/v0.1.0/libhipflex
 # Limit any GPU process to 24 GiB of VRAM
 LD_PRELOAD=./libhipflex.so FH_MEMORY_LIMIT=24GiB python3 your_script.py
 
-# Limit memory AND restrict to 38 Compute Units
+# Restrict to 38 Compute Units (no memory limit)
+LD_PRELOAD=./libhipflex.so FH_CU_RANGE=0-37 python3 your_script.py
+
+# Limit memory AND restrict CUs
 LD_PRELOAD=./libhipflex.so FH_MEMORY_LIMIT=24GiB FH_CU_RANGE=0-37 python3 your_script.py
 ```
 
@@ -272,7 +275,7 @@ hipflex uses `LD_PRELOAD` to intercept 27 HIP memory APIs (`hipMalloc`, `hipFree
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FH_MEMORY_LIMIT` | *(none)* | VRAM limit per GPU (e.g., `24GiB`, `8G`, `4096M`) |
-| `FH_CU_RANGE` | *(none)* | CU restriction (e.g., `0-37` for 38 CUs). Sets `HSA_CU_MASK` and spoofs `multiProcessorCount`. Requires `FH_MEMORY_LIMIT` (standalone mode) |
+| `FH_CU_RANGE` | *(none)* | CU restriction, applied uniformly to all visible GPUs (e.g., `0-37` for 38 CUs). Sets `HSA_CU_MASK` and spoofs `multiProcessorCount`. Works independently or with `FH_MEMORY_LIMIT` |
 | `FH_LOG_PATH` | *(none)* | Log output: `stderr`, or a file path |
 | `FH_HIP_LIB_PATH` | `libamdhip64.so` | Path to HIP runtime library |
 | `FH_ENABLE_HOOKS` | `true` | Set to `false` to disable all hooks |

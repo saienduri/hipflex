@@ -23,9 +23,10 @@ The limiter is transparent to applications. Frameworks see the configured VRAM l
 | Priority | Mode | Trigger | SHM Source | Config Source |
 |----------|------|---------|------------|---------------|
 | 1 | **Standalone** | `FH_MEMORY_LIMIT` set | Self-created | GPU auto-discovery via KFD sysfs |
-| 2 | **Mock/test** | `FH_SHM_FILE` + `FH_VISIBLE_DEVICES` set | Local file | `FH_VISIBLE_DEVICES` env var |
+| 2 | **CU-only** | `FH_CU_RANGE` set, no `FH_MEMORY_LIMIT` | None | KFD sysfs topology |
+| 3 | **Mock/test** | `FH_SHM_FILE` + `FH_VISIBLE_DEVICES` set | Local file | `FH_VISIBLE_DEVICES` env var |
 
-If both `FH_MEMORY_LIMIT` and `FH_SHM_FILE` are set, standalone wins with a warning.
+If both `FH_MEMORY_LIMIT` and `FH_SHM_FILE` are set, standalone wins with a warning. If both `FH_MEMORY_LIMIT` and `FH_CU_RANGE` are set, standalone mode handles both.
 
 ### Standalone Mode
 
@@ -42,6 +43,18 @@ Init flow:
 8. Install Frida GUM hooks on `libamdhip64.so`
 
 **SHM multi-process safety:** `create()` handles the race where the segment already exists by opening it instead of failing. Only the first creator writes initial state; subsequent joiners preserve existing runtime counters so concurrent processes don't stomp each other's `pod_memory_used`.
+
+### CU-only Mode
+
+Restricts Compute Units without memory enforcement. No SHM created, no limiter initialized (`GLOBAL_LIMITER` remains `None`).
+
+Init flow:
+1. Parse `FH_CU_RANGE` → `(start, end)` inclusive CU indices
+2. Enumerate GPUs via KFD sysfs, validate range against topology (clamp, WGP-align on RDNA)
+3. Set `HSA_CU_MASK` env var, store validated range for `multiProcessorCount` spoofing
+4. Install hooks — alloc/free/info hooks pass through to native, `hipGetDeviceProperties` spoofs `multiProcessorCount`
+
+Memory behavior: `hipMemGetInfo` and `hipDeviceTotalMem` report real hardware values. Allocations have no size enforcement.
 
 ### Mock/Test Mode
 
@@ -156,7 +169,9 @@ Each compiled kernel contributes ~1–50 MiB as a code object in VRAM. The overh
 
 **How it works:**
 
-1. `FH_CU_RANGE` is parsed during `init_limiter()` alongside `FH_MEMORY_LIMIT`
+1. `FH_CU_RANGE` is parsed in `init_limiter()` and dispatches to one of two paths:
+   - With `FH_MEMORY_LIMIT`: handled inside `init_standalone_config()` alongside memory setup
+   - Without `FH_MEMORY_LIMIT`: handled by `init_cu_only()`, which enumerates GPUs via KFD sysfs and applies the CU mask without creating SHM or a limiter
 2. After KFD sysfs enumeration, the range is validated against device topology:
    - Clamped to the smallest device's CU count across all visible GPUs
    - On RDNA GPUs (`gfx_target_version` major >= 10), start is rounded down and count is expanded to WGP-aligned boundaries (2-CU granularity). CDNA GPUs (MI300X/MI325X) have individual CU granularity
@@ -166,7 +181,6 @@ Each compiled kernel contributes ~1–50 MiB as a code object in VRAM. The overh
 **Topology parsing:** KFD sysfs provides `simd_count`, `simd_per_cu`, and `gfx_target_version` per GPU node. CU count is `simd_count / simd_per_cu`. `gfx_target_version / 10000` gives the architecture major version (>= 10 = RDNA/WGP mode, < 10 = CDNA/CU mode).
 
 **Limitations:**
-- Requires `FH_MEMORY_LIMIT` (standalone mode). `FH_CU_RANGE` without `FH_MEMORY_LIMIT` logs a warning and is ignored
 - Requires KFD sysfs. If sysfs enumeration fails, CU masking is skipped with a warning
 - `HSA_CU_MASK` operates at the HSA/KFD level below HIP's stream abstraction — `hipExtStreamGetCUMask` on a regular stream will still show all CUs. The restriction is enforced at the hardware queue level
 
@@ -256,8 +270,8 @@ AMD GPU UUIDs are PCI BDF-based. `normalize_uuid_to_bdf()` unifies naming conven
 | **Invalid `FH_MEMORY_LIMIT`** | Limiter not initialized, all hooks passthrough. |
 | **`FH_MEMORY_LIMIT` with no visible GPUs** | Limiter not initialized. Logged as error. |
 | **SHM directory not writable** | Limiter not initialized, passthrough. |
-| **Invalid `FH_CU_RANGE`** | Warning logged, CU masking skipped. Memory enforcement still active. |
-| **`FH_CU_RANGE` without `FH_MEMORY_LIMIT`** | Warning logged, CU masking ignored (requires standalone mode). |
+| **Invalid `FH_CU_RANGE`** | Warning logged, CU masking skipped. Memory enforcement still active if `FH_MEMORY_LIMIT` is set. |
+| **`FH_CU_RANGE` without `FH_MEMORY_LIMIT`** | CU-only mode: CU masking applied, `multiProcessorCount` spoofed, memory hooks pass through to native (real hardware VRAM reported). |
 | **`FH_CU_RANGE` exceeds device CUs** | Clamped to device CU count with a warning. |
 | **KFD sysfs unavailable with `FH_CU_RANGE`** | CU masking skipped (cannot validate range or set `HSA_CU_MASK`). |
 

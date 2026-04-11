@@ -6,18 +6,14 @@ Key behaviors under test:
   - Kernel execution succeeds with restricted CU range
   - multiProcessorCount reflects the CU range, not the physical CU count
   - hipExtStreamCreateWithCUMask roundtrip verifies CU mask pipeline end-to-end
-  - Edge cases: invalid ranges, reversed ranges, clamping, missing FH_MEMORY_LIMIT
+  - CU-only mode: FH_CU_RANGE works without FH_MEMORY_LIMIT (allocation passthrough,
+    totalGlobalMem reports real hardware, multiProcessorCount spoofed, kernel execution)
+  - Edge cases: invalid ranges, reversed ranges, clamping
 """
-
-import os
-import subprocess
-import sys
-import tempfile
-import textwrap
 
 import pytest
 
-from conftest import run_standalone, requires_gpu, SubprocessResult, DEFAULT_HIPFLEX_LIB, SUBPROCESS_TIMEOUT
+from conftest import run_standalone, requires_gpu
 
 pytestmark = requires_gpu
 
@@ -314,50 +310,154 @@ class TestCUMaskEdgeCases:
             f"Expected clamp warning in logs:\n{result.output}"
         )
 
-    def test_cu_range_without_memory_limit_warns(self):
-        """FH_CU_RANGE without FH_MEMORY_LIMIT should warn and proceed without CU masking."""
-        script = textwrap.dedent("""
+    def test_cu_range_without_memory_limit(self):
+        """FH_CU_RANGE without FH_MEMORY_LIMIT should apply CU masking (CU-only mode)."""
+        result = run_standalone("""
+            import ctypes
+            import ctypes.util
+
+            hip = ctypes.CDLL("libamdhip64.so")
+
+            # Trigger HIP init
+            count = ctypes.c_int(0)
+            err = hip.hipGetDeviceCount(ctypes.byref(count))
+            assert err == 0, f"hipGetDeviceCount failed: {err}"
+
+            # Verify HSA_CU_MASK was set (read from C environment, not Python's cached os.environ)
+            libc = ctypes.CDLL(ctypes.util.find_library("c"))
+            libc.getenv.restype = ctypes.c_char_p
+            libc.getenv.argtypes = [ctypes.c_char_p]
+            raw = libc.getenv(b"HSA_CU_MASK")
+            mask = raw.decode() if raw else ""
+            print(f"HSA_CU_MASK={mask}")
+            assert mask, "HSA_CU_MASK not set"
+
+            # Verify multiProcessorCount is spoofed to 38
             from hip_helper import HIPRuntime
-            hip = HIPRuntime()
-            count = hip.get_device_count()
-            assert count > 0, "No devices"
+            hip_rt = HIPRuntime()
+            mp_count = hip_rt.get_device_properties_multi_processor_count()
+            print(f"multiProcessorCount={mp_count}")
+            assert mp_count == 38, f"expected 38, got {mp_count}"
+
             print("PASS")
-        """)
-
-        env = os.environ.copy()
-        env["LD_PRELOAD"] = DEFAULT_HIPFLEX_LIB
-        env["FH_CU_RANGE"] = "0-37"
-        env["FH_ENABLE_HOOKS"] = "true"
-        env["FH_LOG_PATH"] = "stderr"
-        env.pop("FH_MEMORY_LIMIT", None)
-        env.pop("FH_SHM_FILE", None)
-        env.pop("FH_VISIBLE_DEVICES", None)
-
-        cts_dir = os.path.dirname(os.path.abspath(__file__))
-        env["PYTHONPATH"] = cts_dir
-
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
-            f.write(script)
-            script_path = f.name
-
-        try:
-            proc = subprocess.run(
-                [sys.executable, script_path],
-                capture_output=True, text=True,
-                timeout=SUBPROCESS_TIMEOUT, env=env,
-                cwd=cts_dir,
-            )
-            result = SubprocessResult(
-                returncode=proc.returncode, stdout=proc.stdout,
-                stderr=proc.stderr, output=proc.stdout + proc.stderr,
-            )
-        finally:
-            os.unlink(script_path)
+        """, mem_limit=None, cu_range="0-37",
+             extra_env={"FH_LOG_PATH": "stderr"})
 
         assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
         assert "PASS" in result.stdout, (
-            f"Process failed:\n{result.stdout}\n{result.stderr}"
+            f"CU-only mode failed:\n{result.stdout}\n{result.stderr}"
         )
-        assert "CU masking requires standalone mode" in result.output, (
-            f"Expected standalone-mode warning in logs:\n{result.output}"
+        assert "CU-only mode" in result.output, (
+            f"Expected CU-only mode log:\n{result.output}"
+        )
+
+
+class TestCUOnlyMode:
+    """CU-only mode: FH_CU_RANGE without FH_MEMORY_LIMIT."""
+
+    def test_alloc_passthrough(self):
+        """Memory allocation should pass through to native (no enforcement)."""
+        result = run_standalone("""
+            from hip_helper import HIPRuntime
+
+            hip = HIPRuntime()
+            # Allocate arbitrary size — no limit should be enforced
+            ptr = hip.malloc(256 * 1024 * 1024)  # 256 MiB
+            assert ptr != 0, "hipMalloc returned null"
+            hip.free(ptr)
+            print("PASS")
+        """, mem_limit=None, cu_range="0-37")
+
+        assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
+        assert "PASS" in result.stdout, (
+            f"Allocation passthrough failed:\n{result.stdout}\n{result.stderr}"
+        )
+
+    def test_total_global_mem_not_spoofed(self):
+        """hipGetDeviceProperties.totalGlobalMem should report real hardware value."""
+        result = run_standalone("""
+            from hip_helper import HIPRuntime
+
+            hip = HIPRuntime()
+            # In CU-only mode, totalGlobalMem must NOT be spoofed.
+            # MI325X has ~256 GiB — should be well above 100 GiB.
+            total = hip.get_device_properties_total_mem()
+            print(f"totalGlobalMem={total}")
+            gib = total / (1024 ** 3)
+            assert gib > 100, f"totalGlobalMem suspiciously low ({gib:.1f} GiB), may be spoofed"
+            print("PASS")
+        """, mem_limit=None, cu_range="0-37")
+
+        assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
+        assert "PASS" in result.stdout, (
+            f"totalGlobalMem appears spoofed:\n{result.stdout}\n{result.stderr}"
+        )
+
+    def test_mem_get_info_passthrough(self):
+        """hipMemGetInfo should report real hardware values (no spoofing)."""
+        result = run_standalone("""
+            from hip_helper import HIPRuntime
+
+            hip = HIPRuntime()
+            free, total = hip.mem_get_info()
+            print(f"free={free} total={total}")
+            gib = total / (1024 ** 3)
+            assert gib > 100, f"hipMemGetInfo total suspiciously low ({gib:.1f} GiB), may be spoofed"
+            assert free > 0, "hipMemGetInfo free is 0"
+            print("PASS")
+        """, mem_limit=None, cu_range="0-37")
+
+        assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
+        assert "PASS" in result.stdout, (
+            f"hipMemGetInfo passthrough failed:\n{result.stdout}\n{result.stderr}"
+        )
+
+    def test_device_total_mem_passthrough(self):
+        """hipDeviceTotalMem should report real hardware value (no spoofing)."""
+        result = run_standalone("""
+            from hip_helper import HIPRuntime
+
+            hip = HIPRuntime()
+            total = hip.device_total_mem(0)
+            print(f"hipDeviceTotalMem={total}")
+            gib = total / (1024 ** 3)
+            assert gib > 100, f"hipDeviceTotalMem suspiciously low ({gib:.1f} GiB), may be spoofed"
+            print("PASS")
+        """, mem_limit=None, cu_range="0-37")
+
+        assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
+        assert "PASS" in result.stdout, (
+            f"hipDeviceTotalMem passthrough failed:\n{result.stdout}\n{result.stderr}"
+        )
+
+    def test_kernel_execution(self):
+        """Kernel execution should succeed in CU-only mode."""
+        result = run_standalone("""
+            import ctypes
+
+            hip = ctypes.CDLL("libamdhip64.so")
+
+            ptr = ctypes.c_void_p(0)
+            err = hip.hipMalloc(ctypes.byref(ptr), 1024)
+            assert err == 0, f"hipMalloc failed: {err}"
+
+            err = hip.hipMemset(ptr, 0, 1024)
+            assert err == 0, f"hipMemset failed: {err}"
+
+            err = hip.hipDeviceSynchronize()
+            assert err == 0, f"hipDeviceSynchronize failed: {err}"
+
+            err = hip.hipFree(ptr)
+            assert err == 0, f"hipFree failed: {err}"
+
+            print("PASS")
+        """, mem_limit=None, cu_range="0-37",
+             extra_env={"FH_LOG_PATH": "stderr"})
+
+        assert result.returncode == 0, f"Subprocess failed:\n{result.stderr}"
+        assert "PASS" in result.stdout, (
+            f"Kernel execution failed:\n{result.stdout}\n{result.stderr}"
+        )
+        assert "CU range restriction" in result.output, (
+            f"CU masking not active in logs:\n{result.output}"
         )

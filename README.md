@@ -25,7 +25,10 @@ cargo build --release -p hipflex
 # Limit each GPU to 4 GiB
 FH_MEMORY_LIMIT=4GiB LD_PRELOAD=./libhipflex.so python3 train.py
 
-# Limit memory AND restrict to 38 of 304 CUs on MI325X
+# Restrict to 38 of 304 CUs on MI325X (no memory limit)
+FH_CU_RANGE=0-37 LD_PRELOAD=./libhipflex.so python3 train.py
+
+# Limit memory AND restrict CUs
 FH_MEMORY_LIMIT=24GiB FH_CU_RANGE=0-37 LD_PRELOAD=./libhipflex.so python3 train.py
 ```
 
@@ -89,7 +92,7 @@ All configuration is via environment variables.
 | Variable | Description |
 |----------|-------------|
 | `FH_MEMORY_LIMIT` | Per-GPU memory limit. Accepts bytes, SI, binary, or fractional sizes. |
-| `FH_CU_RANGE` | Restrict GPU Compute Units. Format: `start-end` (inclusive, e.g., `0-37` for 38 CUs). Sets `HSA_CU_MASK` and spoofs `multiProcessorCount`. Requires `FH_MEMORY_LIMIT` (standalone mode). |
+| `FH_CU_RANGE` | Restrict GPU Compute Units, applied uniformly to all visible GPUs. Format: `start-end` (inclusive, e.g., `0-37` for 38 CUs). Sets `HSA_CU_MASK` and spoofs `multiProcessorCount`. Works independently or with `FH_MEMORY_LIMIT`. |
 | `FH_ENABLE_HOOKS` | Set to `false` to disable all hooking (library becomes a no-op). Default: `true`. |
 | `FH_HIP_LIB_PATH` | Override path to `libamdhip64.so`. |
 | `FH_SHM_PATH` | Override shared memory directory. Default: `/dev/shm/hipflex`. |

@@ -108,6 +108,9 @@ fn record_limiter_error(message: impl Into<String>) {
 }
 
 pub(crate) fn report_limiter_not_initialized() {
+    if CU_RANGE.get().is_some() {
+        return;
+    }
     if LIMITER_ERROR_REPORTED
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
         .is_ok()
@@ -311,6 +314,35 @@ fn apply_cu_mask(start: u32, end: u32, devices: &[kfd::GpuDevice]) {
     tracing::info!("HSA_CU_MASK={mask_str}");
 }
 
+/// CU-only mode: enumerate GPUs and apply CU mask without memory enforcement.
+fn apply_validated_cu_mask(start: u32, end: u32, devices: &[kfd::GpuDevice]) {
+    let (start, end) = validate_cu_range(start, end, devices);
+    apply_cu_mask(start, end, devices);
+    if CU_RANGE.set((start, end)).is_err() {
+        tracing::warn!(
+            "CU_RANGE already set (unexpected re-init), spoofing will use the first value"
+        );
+    }
+}
+
+fn init_cu_only(cu_range: (u32, u32)) {
+    match kfd::enumerate_gpu_devices() {
+        Ok(devices) => {
+            apply_validated_cu_mask(cu_range.0, cu_range.1, &devices);
+            tracing::info!(
+                device_count = devices.len(),
+                "CU-only mode: CU masking applied via KFD sysfs (no memory enforcement)"
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                "FH_CU_RANGE is set but KFD sysfs enumeration failed ({e}); \
+                 CU masking requires /sys/class/kfd/ — is the container missing --device=/dev/kfd?"
+            );
+        }
+    }
+}
+
 /// Standalone mode: parse FH_MEMORY_LIMIT, enumerate GPUs, create SHM.
 fn init_standalone_config(
     mem_limit_str: &str,
@@ -345,15 +377,10 @@ fn init_standalone_config(
                 cfgs.push(config);
             }
             if let Some((start, end)) = cu_range {
-                let (start, end) = validate_cu_range(start, end, &devices);
-                apply_cu_mask(start, end, &devices);
-                if CU_RANGE.set((start, end)).is_err() {
-                    tracing::warn!("CU_RANGE already set (unexpected re-init), spoofing will use the first value");
-                }
+                apply_validated_cu_mask(start, end, &devices);
             }
 
-            let kfd_devs = devices;
-            (uuids, cfgs, Some(enumerated), kfd_devs)
+            (uuids, cfgs, Some(enumerated), devices)
         }
         Err(e) => {
             tracing::warn!("KFD sysfs enumeration failed ({e}), falling back to HIP runtime");
@@ -468,13 +495,10 @@ fn init_limiter() {
                         return;
                     }
                 }
+            } else if let Some(cu_range) = parsed_cu_range {
+                init_cu_only(cu_range);
+                return;
             } else {
-                if parsed_cu_range.is_some() {
-                    tracing::warn!(
-                        "FH_CU_RANGE is set but FH_MEMORY_LIMIT is not; \
-                         CU masking requires standalone mode (FH_MEMORY_LIMIT)"
-                    );
-                }
                 match init_mock_config() {
                     Ok(config) => (config, None, None, None, Vec::new()),
                     Err(e) => {
@@ -614,20 +638,22 @@ fn init_hooks() {
     logging::init();
     init_limiter();
 
-    let limiter = match GLOBAL_LIMITER.get() {
-        Some(limiter) => limiter,
+    let limiter = GLOBAL_LIMITER.get();
+    let has_cu_range = CU_RANGE.get().is_some();
+
+    match limiter {
+        Some(_) => {}
+        None if has_cu_range => {
+            tracing::info!("CU-only mode: proceeding with hook installation (memory hooks will pass through to native)");
+        }
         None => {
-            // Limiter failed to initialize (e.g., missing config env vars).
-            // Gracefully skip hooks — the library becomes a passthrough.
-            // Set HOOKS_INITIALIZED to prevent the dlsym detour from
-            // repeatedly calling try_install_hip_hooks() on every lookup.
             HOOKS_INITIALIZED.store(true, Ordering::Release);
             report_limiter_not_initialized();
             return;
         }
-    };
+    }
 
-    let isolation = limiter.isolation();
+    let isolation = limiter.and_then(|l| l.isolation());
     let should_skip_isolation = isolation.is_some_and(|iso| iso != limiter::ISOLATION_SOFT);
 
     if should_skip_isolation {
@@ -639,7 +665,7 @@ fn init_hooks() {
         return;
     }
 
-    if should_skip_hooks_on_no_limit() && limiter.all_devices_unlimited() {
+    if should_skip_hooks_on_no_limit() && limiter.is_some_and(|l| l.all_devices_unlimited()) {
         tracing::info!("All devices unlimited, skipping hooks installation");
         HOOKS_INITIALIZED.store(true, Ordering::Release);
         return;
@@ -1032,22 +1058,9 @@ mod tests {
 
     #[test]
     fn test_validate_cu_range_rdna_wgp_shifts_start() {
-        let devices = vec![kfd::GpuDevice {
-            pci_bdf: "0000:75:00.0".into(),
-            render_minor: 128,
-            gpu_id: 12345,
-            cu_count: Some(10),
-            gfx_target_version: Some(110000), // RDNA3
-        }];
-        // After clamp: start=0, end=9, count=10 (even) — no WGP fixup needed.
-        // Try: start=0, end=8, count=9 (odd). end+1=9 == cu_count-1=9, expand works.
-        // Need: start=2, end=9. count=8 (even) — no fixup. Not a shift-start case.
-        // Real shift-start: start=2, cu_count=4 → clamp end to 3, count=2 (even) — no fixup.
-        // Real shift-start: cu_count=9, start=0, end=8. After clamp end=8, count=9 (odd).
-        //   expanded_end=9 > max_end=8, can't expand. start>=2, so shift: start=0-2=-2? No, start=0<2.
-        // Real shift-start: cu_count=9, start=4, end=8. count=5 (odd).
-        //   expanded_end=9 > max_end=8, can't expand. start=4>=2, shift: start=4-2=2, end=8-1=7. count=6 (even).
-        let devices2 = vec![kfd::GpuDevice {
+        // cu_count=9, start=4, end=8. count=5 (odd).
+        //   expanded_end=9 > max_end=8, can't expand. start=4>=2, shift: start=2, end=7. count=6 (even).
+        let devices2 = [kfd::GpuDevice {
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 12345,
@@ -1060,17 +1073,9 @@ mod tests {
 
     #[test]
     fn test_validate_cu_range_rdna_wgp_best_effort() {
-        let devices = vec![kfd::GpuDevice {
-            pci_bdf: "0000:75:00.0".into(),
-            render_minor: 128,
-            gpu_id: 12345,
-            cu_count: Some(2),
-            gfx_target_version: Some(110000), // RDNA3
-        }];
-        // start=0, end=1, count=2 (even) — no fixup needed. Need odd count at boundary.
         // cu_count=3, start=0, end=2, count=3 (odd). expanded_end=3 > max=2, can't expand.
         // start=0 < 2, can't shift. Best-effort: returns (0, 2) as-is.
-        let devices2 = vec![kfd::GpuDevice {
+        let devices2 = [kfd::GpuDevice {
             pci_bdf: "0000:75:00.0".into(),
             render_minor: 128,
             gpu_id: 12345,
