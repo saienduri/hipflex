@@ -31,5 +31,5 @@ syn = "2"
 libloading = "0.9"
 shared_memory = { git = "https://github.com/NexusGPU/shared_memory.git", rev = "d679661" }
 glob = "0.3"
-dashmap = "6.1"
+dashmap = "6.2"
 humantime = "2.2"
